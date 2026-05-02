@@ -1,0 +1,344 @@
+# tool_pid_vfd.py — VFD Pressure Control Station
+# Extends PID Tuner Station 2.0 with physical-unit mapping:
+#   PV   0–100 %   →  Pressure  0–5 Pa
+#   MV  50–100 %   →  VFD Freq 30–60 Hz  (50 % = min speed = 30 Hz)
+# Defaults: K=0.85, τ=5 s, L=2 s, Kp=1.0, Ki=0.5, MV-MIN=50 %
+
+from PyQt6.QtCore    import Qt
+from PyQt6.QtWidgets import (QFrame, QHBoxLayout, QVBoxLayout,
+                              QLabel, QPushButton)
+
+from tool_pid      import PidTunerBuddy, HAS_PG
+from tool_pid_vfd_anim import VfdAnimWindow
+
+
+# ══════════════════════════════════════════════════════════
+#  VFD PRESSURE TUNER
+# ══════════════════════════════════════════════════════════
+class VfdPressureTuner(PidTunerBuddy):
+    """PID Tuner adapted for VFD-driven differential-pressure (0–5 Pa) control."""
+
+    # ── Physical-unit constants ──────────────────────────────────
+    _PRESS_MIN  = 0.0    # Pa
+    _PRESS_MAX  = 5.0    # Pa
+    _FREQ_MIN   = 30.0   # Hz — MV 50 %
+    _FREQ_MAX   = 60.0   # Hz — MV 100 %
+    _MV_FREQ_LO = 50.0   # % MV → FREQ_MIN
+    _MV_FREQ_HI = 100.0  # % MV → FREQ_MAX
+    _PA_SCALE   = 0.05   # % → Pa  (5 / 100)
+
+    # ── Conversion helpers ───────────────────────────────────────
+    def _pv_to_pa(self, pv_pct: float) -> float:
+        return self._PRESS_MIN + pv_pct / 100.0 * (self._PRESS_MAX - self._PRESS_MIN)
+
+    def _pa_to_pct(self, pa: float) -> float:
+        return pa / self._PRESS_MAX * 100.0
+
+    def _mv_to_hz(self, mv_pct: float) -> float:
+        """Linear: 0%→0 Hz, 50%→30 Hz, 100%→60 Hz  (Hz = MV% × 0.6)."""
+        return max(0.0, min(self._FREQ_MAX,
+                            mv_pct / self._MV_FREQ_HI * self._FREQ_MAX))
+
+    # ════════════════════════════════════════════════════
+    #  BUILD OVERRIDES
+    # ════════════════════════════════════════════════════
+
+    def _build_param_cols(self, lay):
+        # ── VFD defaults (set before parent reads them for UI init) ──
+        self._pK, self._pT, self._pL = 0.85, 5.0, 2.0
+        self._Kp, self._Ki, self._Kd = 1.0,  0.5, 0.0
+
+        _eq  = ("color:#00E5A0;font-size:9pt;font-weight:700;"
+                "background:transparent;border:none;"
+                "font-family:Consolas,'Courier New';")
+        _sep = ("color:#2A4A3A;font-size:7pt;"
+                "background:transparent;border:none;"
+                "font-family:Consolas,'Courier New';")
+        _ann = ("color:#80C8A8;font-size:8.5pt;font-weight:600;"
+                "background:transparent;border:none;"
+                "font-family:'Microsoft JhengHei','Segoe UI';")
+
+        lay.addWidget(self._sec_hdr("≡  主要參數  Controller & Process Parameters"))
+        cols = QHBoxLayout(); cols.setSpacing(10)
+
+        def _div():
+            d = QFrame(); d.setFrameShape(QFrame.Shape.VLine)
+            d.setStyleSheet("QFrame{border:none;border-left:1px solid #242424;"
+                            "background:transparent;}"); return d
+
+        def _framed(hdr, formulas):
+            fr = QFrame()
+            fr.setStyleSheet(f"QFrame{{background:{self._CELL};"
+                             f"border:1px solid {self._ACC};border-radius:4px;}}")
+            outer = QHBoxLayout(fr)
+            outer.setContentsMargins(8, 6, 8, 6); outer.setSpacing(8)
+            lv = QVBoxLayout(); lv.setSpacing(3); lv.setContentsMargins(0, 0, 0, 0)
+            hl = QLabel(hdr)
+            hl.setStyleSheet(f"color:{self._ACC};font-size:8.5pt;font-weight:700;"
+                             f"background:transparent;border:none;padding-bottom:3px;"
+                             f"font-family:'Microsoft JhengHei','Segoe UI';")
+            lv.addWidget(hl)
+            outer.addLayout(lv, 0)
+            outer.addWidget(_div())
+            rv = QVBoxLayout(); rv.setSpacing(1); rv.setContentsMargins(4, 0, 4, 0)
+            for text, style in formulas:
+                fl = QLabel(text); fl.setStyleSheet(style); fl.setWordWrap(True)
+                rv.addWidget(fl)
+            rv.addStretch()
+            outer.addLayout(rv, 1)
+            return fr, lv
+
+        pid_formula = [
+            ("PID 控制核心  Control Core",                              _eq),
+            ("────────────────────────────────────────",               _sep),
+            ("比對 SV 與 PV 誤差，計算 MV 輸出以消除誤差",             _ann),
+            ("P (比例)  ─  依據當前誤差即時反應",                      _ann),
+            ("I (積分)  ─  累積誤差，消除穩態誤差",                    _ann),
+            ("D (微分)  ─  預測誤差趨勢，抑制劇烈變動",               _ann),
+            ("─  MV = Kp·[e + (1/Ti)·∫e dt + Td·de/dt]",            _sep),
+        ]
+        fopdt_formula = [
+            ("FOPDT 物理模型  Process Model",                           _eq),
+            ("────────────────────────────────────────",               _sep),
+            ("簡化工業動態：一階延遲 + 純滯後數學模型",                _ann),
+            ("K  (增益)    ─  MV 變化量造成的 PV 改變幅度",            _ann),
+            ("τ  (時間常數) ─  達最終值 63.2% 所需時間",              _ann),
+            ("L  (延遲)    ─  MV 改變到 PV 開始反應的時間",            _ann),
+            ("─  PV = PV₀ + K·ΔMV·(1 − e^(−(t−L)/τ))",             _sep),
+        ]
+
+        pid_fr,   pid_col   = _framed("動態控制  PID",   pid_formula)
+        fopdt_fr, fopdt_col = _framed("物理模型  FOPDT", fopdt_formula)
+
+        for attr, label, lo, hi, dec in self._PID_SPECS:
+            le = self._param_row(pid_col, attr, label, lo, hi, dec, "")
+            self._pid_inputs[attr] = le
+
+        for attr, label, lo, hi, dec, unit in self._FOPDT_SPECS:
+            self._param_row(fopdt_col, attr, label, lo, hi, dec, unit)
+
+        cols.addWidget(pid_fr, 1); cols.addWidget(fopdt_fr, 1)
+        lay.addLayout(cols)
+
+    def _build_plot(self, lay):
+        super()._build_plot(lay)
+        if HAS_PG and hasattr(self, '_pw'):
+            self._pw.setYRange(-0.2, 5.5, padding=0)
+            self._pw.setLabel("left", "壓力 Pressure (Pa)", color=self._LBL2)
+
+    def _on_hover(self, evt):
+        """Override parent hover: show Pa / Hz instead of %."""
+        if not HAS_PG or not hasattr(self, '_pw'):
+            return
+        pos = evt[0]
+        if not self._pw.sceneBoundingRect().contains(pos):
+            self._hover_lbl.setVisible(False)
+            return
+
+        mp = self._pw.plotItem.vb.mapSceneToView(pos)
+        t  = mp.x()
+        self._xhair.setPos(t)
+
+        ta = list(self._t_data)
+        if len(ta) < 2:
+            self._hover_lbl.setVisible(False)
+            return
+
+        idx   = min(range(len(ta)), key=lambda i: abs(ta[i] - t))
+        pv_pa = list(self._pv_data)[idx] * self._PA_SCALE
+        sv_pa = list(self._sv_data)[idx] * self._PA_SCALE
+        hz    = self._mv_to_hz(list(self._cv_data)[idx])
+
+        self._hover_lbl.setHtml(
+            f'<span style="color:#888888">t = {ta[idx]:.1f} s</span><br/>'
+            f'<span style="color:#00FF88">PV = {pv_pa:.2f} Pa</span><br/>'
+            f'<span style="color:#FF4455">SV = {sv_pa:.2f} Pa</span><br/>'
+            f'<span style="color:#FF8800">Hz = {hz:.1f}</span>')
+
+        xr, yr = (self._pw.plotItem.vb.viewRange()[0],
+                  self._pw.plotItem.vb.viewRange()[1])
+        anchor_x = 1.0 if t > xr[0] + (xr[1] - xr[0]) * 0.6 else 0.0
+        try:
+            self._hover_lbl.setAnchor((anchor_x, 0))
+        except Exception:
+            pass
+        self._hover_lbl.setPos(t, yr[0] + (yr[1] - yr[0]) * 0.98)
+        self._hover_lbl.setVisible(True)
+
+    def _build_live_strip(self, lay):
+        """Pa-labelled PV/SV strip  →  large Pa/Hz panel  →  gauge animation."""
+        # ── Pa live strip ─────────────────────────────────────────
+        f = QFrame()
+        f.setStyleSheet(f"QFrame{{background:{self._CELL};"
+                        f"border:1px solid {self._BORDER};border-radius:4px;}}")
+        f.setFixedHeight(58)
+        h = QHBoxLayout(f); h.setContentsMargins(14, 4, 14, 4); h.setSpacing(0)
+
+        def _big(tag, clr):
+            col = QVBoxLayout(); col.setSpacing(0)
+            lbl = QLabel(tag)
+            lbl.setStyleSheet(
+                f"color:{self._LBL2};font-size:7.5pt;font-weight:600;"
+                f"background:transparent;border:none;"
+                f"font-family:'Microsoft JhengHei','Segoe UI';")
+            rw = QHBoxLayout(); rw.setSpacing(2); rw.setContentsMargins(0, 0, 0, 0)
+            val = QLabel("0.00")
+            val.setStyleSheet(
+                f"color:{clr};font-size:19pt;font-weight:700;"
+                f"background:transparent;border:none;"
+                f"font-family:Consolas,'Courier New';"
+                f"font-variant-numeric:tabular-nums;")
+            unit = QLabel("Pa")
+            unit.setStyleSheet(
+                f"color:#606060;font-size:10pt;font-weight:600;"
+                f"background:transparent;border:none;"
+                f"font-family:'Segoe UI';padding-bottom:2px;")
+            unit.setAlignment(Qt.AlignmentFlag.AlignBottom)
+            rw.addWidget(val); rw.addWidget(unit); rw.addStretch()
+            col.addWidget(lbl); col.addLayout(rw)
+            return col, val
+
+        pv_lay, self._pv_disp = _big("PV  現在值", self._PV_CLR)
+        sv_lay, self._sv_disp = _big("SV  設定值", self._SV_CLR)
+        h.addLayout(pv_lay, 1)
+        h.addWidget(self._vline())
+        h.addSpacing(12)
+        h.addLayout(sv_lay, 1)
+        lay.addWidget(f)
+
+        # ── Large Pa / Hz readout panel ───────────────────────────
+        self._build_vfd_panel(lay)
+
+    def _build_vfd_panel(self, lay: QVBoxLayout):
+        """Large Pa / Hz display with range labels."""
+        f = QFrame()
+        f.setStyleSheet(
+            "QFrame{background:#0D1A12;"
+            "border:1px solid #1A4A2A;border-radius:4px;}")
+        f.setFixedHeight(82)
+        outer = QHBoxLayout(f)
+        outer.setContentsMargins(14, 6, 14, 6)
+        outer.setSpacing(0)
+
+        def _col(label, unit, color, lo, hi):
+            col = QVBoxLayout(); col.setSpacing(1)
+            hdr = QLabel(label)
+            hdr.setStyleSheet(
+                f"color:{self._LBL2};font-size:7.5pt;font-weight:600;"
+                "background:transparent;border:none;"
+                "font-family:'Microsoft JhengHei','Segoe UI';")
+            rw = QHBoxLayout(); rw.setSpacing(4); rw.setContentsMargins(0, 0, 0, 0)
+            val = QLabel("  0.00")
+            val.setStyleSheet(
+                f"color:{color};font-size:22pt;font-weight:700;"
+                "background:transparent;border:none;"
+                "font-family:Consolas,'Courier New';"
+                "font-variant-numeric:tabular-nums;")
+            utag = QLabel(unit)
+            utag.setStyleSheet(
+                f"color:{color};font-size:13pt;font-weight:700;"
+                "background:transparent;border:none;"
+                "font-family:'Segoe UI';padding-bottom:5px;")
+            utag.setAlignment(Qt.AlignmentFlag.AlignBottom)
+            rw.addWidget(val); rw.addWidget(utag); rw.addStretch()
+            rng = QLabel(f"MAX {hi:.0f} {unit}    MIN {lo:.0f} {unit}")
+            rng.setStyleSheet(
+                "color:#505050;font-size:7.5pt;font-weight:600;"
+                "background:transparent;border:none;"
+                "font-family:'Segoe UI';")
+            col.addWidget(hdr); col.addLayout(rw); col.addWidget(rng)
+            return col, val
+
+        pa_col, self._pa_disp = _col(
+            "壓力  Pressure", "Pa", self._OK,
+            self._PRESS_MIN, self._PRESS_MAX)
+        hz_col, self._hz_disp = _col(
+            "VFD 頻率  Frequency", "Hz", self._ACC,
+            self._FREQ_MIN, self._FREQ_MAX)
+
+        outer.addLayout(pa_col, 1)
+        outer.addWidget(self._vline())
+        outer.addSpacing(12)
+        outer.addLayout(hz_col, 1)
+        lay.addWidget(f)
+
+        # ── Animation launch button ───────────────────────────────
+        anim_btn = QPushButton("⚡  開啟泵浦動畫  Open Pump Animation")
+        anim_btn.setFixedHeight(32)
+        anim_btn.setStyleSheet(
+            "QPushButton{background:#0D1A12;color:#00CC66;"
+            "border:1px solid #1A4A2A;border-radius:5px;"
+            "font-size:9.5pt;font-weight:700;"
+            "font-family:'Microsoft JhengHei','Segoe UI';}"
+            "QPushButton:hover{background:#143A20;color:#00FF88;"
+            "border-color:#2A6A3A;}")
+        anim_btn.clicked.connect(self._open_anim)
+        lay.addWidget(anim_btn)
+
+    # ── Animation window (lazy-created) ─────────────────────────
+    def _open_anim(self):
+        if not hasattr(self, '_anim_win'):
+            self._anim_win = VfdAnimWindow()
+            scr = self.screen().availableGeometry() if self.screen() else None
+            if scr:
+                self._anim_win.move(
+                    min(self.x() + self.width() + 12, scr.right() - 380),
+                    self.y())
+        self._anim_win.show(); self._anim_win.raise_()
+
+    def _build_ctrl_row(self, lay):
+        """SV and Init SV accept Pa values; default SV=2.5 Pa, init=0 Pa."""
+        self._sv_init = 0.0
+        super()._build_ctrl_row(lay)
+        self._sv_in.setText(f"{self._pv_to_pa(self._sv_pct):.2f}")
+        self._sv_init_in.setText(f"{self._pv_to_pa(self._sv_init):.2f}")
+
+    def _build_mv_limit_row(self, lay):
+        """Set MV MIN to 50 % (VFD minimum-speed threshold) before building."""
+        self._mv_min = 50.0
+        super()._build_mv_limit_row(lay)
+
+    # ── SV / Init SV: accept Pa, store as % ──────────────────────
+    def _sv_changed(self):
+        try:
+            v_pa = max(self._PRESS_MIN, min(self._PRESS_MAX,
+                       float(self._sv_in.text())))
+        except ValueError:
+            v_pa = self._pv_to_pa(self._sv_pct)
+        self._sv_pct = self._pa_to_pct(v_pa)
+        self._sv_in.setText(f"{v_pa:.2f}")
+
+    def _sv_init_changed(self):
+        try:
+            v_pa = max(self._PRESS_MIN, min(self._PRESS_MAX,
+                       float(self._sv_init_in.text())))
+        except ValueError:
+            v_pa = self._pv_to_pa(self._sv_init)
+        self._sv_init = self._pa_to_pct(v_pa)
+        self._sv_init_in.setText(f"{v_pa:.2f}")
+
+    # ════════════════════════════════════════════════════
+    #  SIM TICK
+    # ════════════════════════════════════════════════════
+    def _sim_tick(self):
+        super()._sim_tick()
+
+        # Rescale all plot curves to Pa domain
+        if self._step % 4 == 0 and HAS_PG:
+            ta = list(self._t_data)
+            self._pv_curve.setData(ta, [v * self._PA_SCALE for v in self._pv_data])
+            self._sv_curve.setData(ta, [v * self._PA_SCALE for v in self._sv_data])
+            self._cv_curve.setData(ta, [v * self._PA_SCALE for v in self._cv_data])
+
+        # Update all physical-unit displays every 10 ticks (~2 Hz)
+        if self._step % 10 == 0:
+            pa    = self._pv_to_pa(self._pv_n * 100.0)
+            sv_pa = self._pv_to_pa(self._sv_pct)
+            hz    = self._mv_to_hz(self._last_cv * 100.0)
+
+            self._pv_disp.setText(f"{pa:5.2f}")
+            self._sv_disp.setText(f"{sv_pa:5.2f}")
+            self._pa_disp.setText(f"{pa:6.2f}")
+            self._hz_disp.setText(f"{hz:5.1f}")
+            if hasattr(self, '_anim_win') and self._anim_win.isVisible():
+                self._anim_win.update_values(pa, hz, sv_pa)

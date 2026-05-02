@@ -200,6 +200,59 @@ class PidTunerBuddy(BaseToolWindow):
         lay.addWidget(pw, 3)
         self._pw = pw
 
+        # Vertical crosshair
+        self._xhair = pg.InfiniteLine(
+            angle=90, movable=False,
+            pen=pg.mkPen((200, 200, 200, 55), width=1))
+        pw.addItem(self._xhair, ignoreBounds=True)
+
+        # Hover value label
+        self._hover_lbl = pg.TextItem(
+            anchor=(0, 0), fill=pg.mkBrush(8, 12, 20, 210))
+        self._hover_lbl.setVisible(False)
+        pw.addItem(self._hover_lbl)
+
+        self._mouse_proxy = pg.SignalProxy(
+            pw.scene().sigMouseMoved, rateLimit=60, slot=self._on_hover)
+
+    def _on_hover(self, evt):
+        if not HAS_PG or not hasattr(self, '_pw'):
+            return
+        pos = evt[0]
+        if not self._pw.sceneBoundingRect().contains(pos):
+            self._hover_lbl.setVisible(False)
+            return
+
+        mp = self._pw.plotItem.vb.mapSceneToView(pos)
+        t  = mp.x()
+        self._xhair.setPos(t)
+
+        ta = list(self._t_data)
+        if len(ta) < 2:
+            self._hover_lbl.setVisible(False)
+            return
+
+        idx = min(range(len(ta)), key=lambda i: abs(ta[i] - t))
+        pv  = list(self._pv_data)[idx]
+        sv  = list(self._sv_data)[idx]
+        mv  = list(self._cv_data)[idx]
+
+        self._hover_lbl.setHtml(
+            f'<span style="color:#888888">t = {ta[idx]:.1f} s</span><br/>'
+            f'<span style="color:{self._PV_CLR}">PV = {pv:.1f} %</span><br/>'
+            f'<span style="color:{self._SV_CLR}">SV = {sv:.1f} %</span><br/>'
+            f'<span style="color:{self._MV_CLR}">MV = {mv:.1f} %</span>')
+
+        xr, yr = (self._pw.plotItem.vb.viewRange()[0],
+                  self._pw.plotItem.vb.viewRange()[1])
+        anchor_x = 1.0 if t > xr[0] + (xr[1] - xr[0]) * 0.6 else 0.0
+        try:
+            self._hover_lbl.setAnchor((anchor_x, 0))
+        except Exception:
+            pass
+        self._hover_lbl.setPos(t, yr[0] + (yr[1] - yr[0]) * 0.98)
+        self._hover_lbl.setVisible(True)
+
     def _build_live_strip(self, lay: QVBoxLayout):
         """Large PV / SV live values."""
         f = QFrame()
@@ -451,19 +504,22 @@ class PidTunerBuddy(BaseToolWindow):
             return fr, lv
 
         pid_formula = [
-            ("Z-N  經典法則  Classic Tuning Rules",           _eq),
-            ("────────────────────────────────────────",      _sep),
-            ("P    Kp = 0.50 × Ku",                          _ann),
-            ("PI   Kp = 0.45 × Ku    Ti = Pu / 1.2",        _ann),
-            ("PID  Kp = 0.60 × Ku    Ti = Pu / 2    Td = Pu / 8", _ann),
-            ("─  響應快、超調大、適合頻繁負荷變化",            _sep),
+            ("PID 控制核心  Control Core",                              _eq),
+            ("────────────────────────────────────────",               _sep),
+            ("比對 SV 與 PV 誤差，計算 MV 輸出以消除誤差",             _ann),
+            ("P (比例)  ─  依據當前誤差即時反應",                      _ann),
+            ("I (積分)  ─  累積誤差，消除穩態誤差",                    _ann),
+            ("D (微分)  ─  預測誤差趨勢，抑制劇烈變動",               _ann),
+            ("─  MV = Kp·[e + (1/Ti)·∫e dt + Td·de/dt]",            _sep),
         ]
         fopdt_formula = [
-            ("T-L  穩健法則  Robust Tuning Rules",            _eq),
-            ("────────────────────────────────────────",      _sep),
-            ("PI   Kp = 0.35 × Ku    Ti = Pu / 1.6",        _ann),
-            ("PID  Kp = 0.60 × Ku    Ti = Pu / 2    Td = Pu / 8", _ann),
-            ("─  阻尼好、超調小、適合精密溫壓製程",            _sep),
+            ("FOPDT 物理模型  Process Model",                           _eq),
+            ("────────────────────────────────────────",               _sep),
+            ("簡化工業動態：一階延遲 + 純滯後數學模型",                _ann),
+            ("K  (增益)    ─  MV 變化量造成的 PV 改變幅度",            _ann),
+            ("τ  (時間常數) ─  達最終值 63.2% 所需時間",              _ann),
+            ("L  (延遲)    ─  MV 改變到 PV 開始反應的時間",            _ann),
+            ("─  PV = PV₀ + K·ΔMV·(1 − e^(−(t−L)/τ))",             _sep),
         ]
 
         pid_fr, pid_col = _framed_col("動態視覺  PID", pid_formula)

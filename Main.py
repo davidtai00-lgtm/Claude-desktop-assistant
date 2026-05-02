@@ -16,6 +16,7 @@ from styles import (BASE_DIR, ASSETS_DIR, CONFIG_FILE, asset,
 # ── Tool windows ─────────────────────────────────────────────────────────────
 from tool_network        import IPMonitor
 from tool_pid            import PidTunerBuddy
+from tool_pid_vfd        import VfdPressureTuner
 from tool_unit_converter import UnitConverterTool
 from tool_advanced_calc  import AdvancedCalcTool
 
@@ -147,15 +148,17 @@ class ClawdeWindow(QWidget):
         # Tool windows
         self.ip_mon    = IPMonitor()
         self.pid_tuner = PidTunerBuddy()
+        self.vfd_tuner = VfdPressureTuner()
         self.unit_conv = UnitConverterTool()
         self.adv_calc  = AdvancedCalcTool()
 
         # Launcher
         self.launcher = LauncherBar({
-            "🌐 IP 監控器":  self._open_ip,
-            "⚙️ PID Tuner": self._open_pid,
-            "📐 單位換算器": self._open_unit,
-            "🔬 進階計算器": self._open_adv,
+            "🌐 IP 監控器":      self._open_ip,
+            "⚙️ PID Tuner":     self._open_pid,
+            "⚡ VFD 壓力控制":   self._open_vfd,
+            "📐 單位換算器":     self._open_unit,
+            "🔬 進階計算器":     self._open_adv,
         })
 
         self._drag_pos = QPoint()
@@ -168,6 +171,9 @@ class ClawdeWindow(QWidget):
         p.fillRect(self.rect(), QColor(0, 0, 0, 0))
 
     # ── Tool openers ───────────────────────────────────────────────────
+    def _open_vfd(self):
+        self.vfd_tuner.center_near(self.pos()); self.vfd_tuner.show(); self.vfd_tuner.raise_()
+
     def _open_unit(self):
         self.unit_conv.center_near(self.pos()); self.unit_conv.show(); self.unit_conv.raise_()
 
