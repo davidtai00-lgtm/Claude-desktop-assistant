@@ -19,6 +19,7 @@ from tool_pid            import PidTunerBuddy
 from tool_pid_vfd        import VfdPressureTuner
 from tool_unit_converter import UnitConverterTool
 from tool_advanced_calc  import AdvancedCalcTool
+from tool_pid_drycool    import AhuDryCoolTuner
 
 # ═══════════════════════════════════════════════════════
 #  YS LOGO  (drawn programmatically — no image files)
@@ -171,12 +172,14 @@ class ClawdeWindow(QWidget):
         self.vfd_tuner = VfdPressureTuner()
         self.unit_conv = UnitConverterTool()
         self.adv_calc  = AdvancedCalcTool()
+        self.ahu_cool  = AhuDryCoolTuner()
 
         # Launcher
         self.launcher = LauncherBar({
             "🌐 IP 監控器":      self._open_ip,
             "⚙️ PID Tuner":     self._open_pid,
             "⚡ VFD 壓力控制":   self._open_vfd,
+            "❄️ AHU 冷卻盤管":  self._open_ahu,
             "📐 單位換算器":     self._open_unit,
             "🔬 進階計算器":     self._open_adv,
         }, close_cb=QApplication.instance().quit)
@@ -193,6 +196,9 @@ class ClawdeWindow(QWidget):
     # ── Tool openers ───────────────────────────────────────────────────
     def _open_vfd(self):
         self.vfd_tuner.center_near(self.pos()); self.vfd_tuner.show(); self.vfd_tuner.raise_()
+
+    def _open_ahu(self):
+        self.ahu_cool.center_near(self.pos()); self.ahu_cool.show(); self.ahu_cool.raise_()
 
     def _open_unit(self):
         self.unit_conv.center_near(self.pos()); self.unit_conv.show(); self.unit_conv.raise_()
