@@ -1,0 +1,61 @@
+{
+  "watchlist": [
+    "^TWII",
+    "2330.TW",
+    "^GSPC",
+    "^IXIC",
+    "^SOX"
+  ],
+  "heat_wall_interval": 60,
+  "ip_channels": [
+    {
+      "label": "CH01",
+      "ip": ""
+    },
+    {
+      "label": "CH02",
+      "ip": ""
+    },
+    {
+      "label": "CH03",
+      "ip": ""
+    },
+    {
+      "label": "CH04",
+      "ip": ""
+    },
+    {
+      "label": "CH05",
+      "ip": ""
+    },
+    {
+      "label": "CH06",
+      "ip": ""
+    },
+    {
+      "label": "CH07",
+      "ip": ""
+    },
+    {
+      "label": "CH08",
+      "ip": ""
+    },
+    {
+      "label": "CH09",
+      "ip": ""
+    },
+    {
+      "label": "CH10",
+      "ip": ""
+    }
+  ],
+  "converter_presets": [
+    {
+      "name": "4-20mA→0-100%",
+      "in_min": 4.0,
+      "in_max": 20.0,
+      "out_min": 0.0,
+      "out_max": 100.0
+    }
+  ]
+}

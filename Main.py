@@ -7,7 +7,7 @@ _YS_LOGO_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logo_y
 from PyQt6.QtCore    import Qt, QPoint, QRect
 from PyQt6.QtGui     import QPixmap, QPainter, QColor, QPen, QPainterPath, QFont
 from PyQt6.QtWidgets import (QApplication, QWidget, QLabel,
-                              QVBoxLayout, QPushButton)
+                              QVBoxLayout, QPushButton, QFrame)
 
 # ── Shared infrastructure ────────────────────────────────────────────────────
 from styles import (BASE_DIR, ASSETS_DIR, CONFIG_FILE, asset,
@@ -83,7 +83,7 @@ def _make_ys_pixmap(size: int = 48) -> QPixmap:
 #  LAUNCHER BAR
 # ═══════════════════════════════════════════════════════
 class LauncherBar(QWidget):
-    def __init__(self, buttons: dict):
+    def __init__(self, buttons: dict, close_cb=None):
         super().__init__(None,
             Qt.WindowType.FramelessWindowHint |
             Qt.WindowType.WindowStaysOnTopHint |
@@ -103,6 +103,26 @@ class LauncherBar(QWidget):
                 "border-color:rgba(255,128,0,88);}")
             btn.clicked.connect(cb); btn.clicked.connect(self.hide)
             lay.addWidget(btn)
+
+        if close_cb is not None:
+            sep = QFrame()
+            sep.setFrameShape(QFrame.Shape.HLine)
+            sep.setStyleSheet("QFrame{border:none;border-top:1px solid "
+                              "rgba(255,255,255,0.08);background:transparent;}")
+            sep.setFixedHeight(1)
+            lay.addWidget(sep)
+
+            cb_btn = QPushButton("✕   關閉  Exit"); cb_btn.setFixedHeight(36)
+            cb_btn.setStyleSheet(
+                "QPushButton{background:rgba(38,38,38,220);color:#CC4444;"
+                "border:1px solid rgba(255,255,255,0.06);border-radius:7px;"
+                "font-size:13px;font-family:'Microsoft JhengHei','Segoe UI',sans-serif;"
+                "padding:0 14px;text-align:left;}"
+                "QPushButton:hover{background:rgba(180,35,35,210);color:#fff;"
+                "border-color:rgba(220,60,60,88);}")
+            cb_btn.clicked.connect(close_cb)
+            lay.addWidget(cb_btn)
+
         self.setFixedWidth(202); self.adjustSize()
 
     def popup_at(self, pos: QPoint):
@@ -159,7 +179,7 @@ class ClawdeWindow(QWidget):
             "⚡ VFD 壓力控制":   self._open_vfd,
             "📐 單位換算器":     self._open_unit,
             "🔬 進階計算器":     self._open_adv,
-        })
+        }, close_cb=QApplication.instance().quit)
 
         self._drag_pos = QPoint()
         scr = QApplication.primaryScreen().availableGeometry()
