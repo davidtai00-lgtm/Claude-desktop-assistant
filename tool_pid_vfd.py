@@ -8,8 +8,8 @@ from PyQt6.QtCore    import Qt
 from PyQt6.QtWidgets import (QFrame, QHBoxLayout, QVBoxLayout,
                               QLabel, QPushButton)
 
-from tool_pid      import PidTunerBuddy, HAS_PG
-from tool_pid_vfd_anim import VfdAnimWindow
+from tool_pid          import PidTunerBuddy, HAS_PG
+from tool_pid_vfd_anim import _PumpCanvas
 
 
 # ══════════════════════════════════════════════════════════
@@ -27,6 +27,14 @@ class VfdPressureTuner(PidTunerBuddy):
     _MV_FREQ_HI = 100.0  # % MV → FREQ_MAX
     _PA_SCALE   = 0.05   # % → Pa  (5 / 100)
 
+    def __init__(self, on_thinking=None):
+        super().__init__(on_thinking)
+        self.resize(1060, self.height())
+        self.setMinimumWidth(860)
+        # _h_lay already contains [hmi_panel | scroll] from parent
+        self._anim_panel = self._build_anim_panel()
+        self._h_lay.addWidget(self._anim_panel, 1)
+
     # ── Conversion helpers ───────────────────────────────────────
     def _pv_to_pa(self, pv_pct: float) -> float:
         return self._PRESS_MIN + pv_pct / 100.0 * (self._PRESS_MAX - self._PRESS_MIN)
@@ -38,6 +46,128 @@ class VfdPressureTuner(PidTunerBuddy):
         """Linear: 0%→0 Hz, 50%→30 Hz, 100%→60 Hz  (Hz = MV% × 0.6)."""
         return max(0.0, min(self._FREQ_MAX,
                             mv_pct / self._MV_FREQ_HI * self._FREQ_MAX))
+
+    # ── Embedded animation panel ─────────────────────────────────
+    def _build_anim_panel(self) -> QFrame:
+        panel = QFrame(self.content)
+        panel.setMinimumWidth(280)
+        panel.setStyleSheet(
+            f"QFrame{{background:{self._BG};"
+            f"border-left:1px solid {self._BORDER};}}")
+
+        lay = QVBoxLayout(panel)
+        lay.setContentsMargins(6, 8, 6, 8)
+        lay.setSpacing(6)
+
+        # Title
+        title = QLabel("⚡  VFD 泵浦動畫  Pump Simulation")
+        title.setStyleSheet(
+            f"color:{self._ACC};font-size:9.5pt;font-weight:700;"
+            "background:transparent;border:none;"
+            "font-family:'Microsoft JhengHei','Segoe UI';")
+        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        lay.addWidget(title)
+
+        # Pump canvas
+        self._pump_canvas = _PumpCanvas()
+        lay.addWidget(self._pump_canvas, 1)
+
+        # Info strip: Pa / SV / Hz
+        info = QFrame()
+        info.setFixedHeight(58)
+        info.setStyleSheet(
+            "QFrame{background:#0A1018;"
+            "border:1px solid #152030;border-radius:4px;}")
+        ih = QHBoxLayout(info)
+        ih.setContentsMargins(10, 6, 10, 6)
+        ih.setSpacing(0)
+
+        def _val_col(tag: str, init: str, clr: str):
+            col = QVBoxLayout(); col.setSpacing(1); col.setContentsMargins(4, 0, 4, 0)
+            t = QLabel(tag)
+            t.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            t.setStyleSheet("color:#404050;font-size:7pt;font-weight:600;"
+                            "background:transparent;border:none;"
+                            "font-family:'Microsoft JhengHei','Segoe UI';")
+            v = QLabel(init)
+            v.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            v.setStyleSheet(f"color:{clr};font-size:12pt;font-weight:700;"
+                            "background:transparent;border:none;"
+                            "font-family:Consolas,'Courier New';")
+            col.addWidget(t); col.addWidget(v)
+            return v, col
+
+        def _sep():
+            f = QFrame(); f.setFrameShape(QFrame.Shape.VLine)
+            f.setStyleSheet("QFrame{border:none;border-left:1px solid #1A3050;"
+                            "background:transparent;}")
+            return f
+
+        self._anim_pa_val, pa_lay = _val_col("壓力  PV", "0.00 Pa", self._OK)
+        self._anim_sv_val, sv_lay = _val_col("設定  SV", "2.50 Pa", self._SV_CLR)
+        self._anim_hz_val, hz_lay = _val_col("頻率  Hz", "30.0 Hz", self._ACC)
+
+        ih.addLayout(pa_lay, 1)
+        ih.addWidget(_sep())
+        ih.addLayout(sv_lay, 1)
+        ih.addWidget(_sep())
+        ih.addLayout(hz_lay, 1)
+        lay.addWidget(info)
+
+        # Pause button
+        self._pp_paused = False
+        self._pp_btn = QPushButton("⏸   暫停動畫  Pause")
+        self._pp_btn.setFixedHeight(34)
+        self._pp_btn.setStyleSheet(self._pp_qss(False))
+        self._pp_btn.clicked.connect(self._toggle_pause)
+        lay.addWidget(self._pp_btn)
+
+        return panel
+
+    def _pp_qss(self, paused: bool) -> str:
+        if paused:
+            return ("QPushButton{background:#0A2A0A;color:#00FF88;"
+                    "border:1px solid #1A4A1A;border-radius:6px;"
+                    "font-size:10pt;font-weight:700;"
+                    "font-family:'Microsoft JhengHei','Segoe UI';}"
+                    "QPushButton:hover{background:#143A14;color:#FFF;}")
+        return ("QPushButton{background:#1A1A2A;color:#8888FF;"
+                "border:1px solid #2A2A4A;border-radius:6px;"
+                "font-size:10pt;font-weight:700;"
+                "font-family:'Microsoft JhengHei','Segoe UI';}"
+                "QPushButton:hover{background:#22224A;color:#FFF;}")
+
+    def _toggle_pause(self):
+        self._pp_paused = not self._pp_paused
+        self._pump_canvas.set_paused(self._pp_paused)
+        if self._pp_paused:
+            self._pp_btn.setText("▶   啟動動畫  Resume")
+        else:
+            self._pp_btn.setText("⏸   暫停動畫  Pause")
+        self._pp_btn.setStyleSheet(self._pp_qss(self._pp_paused))
+
+    def _hmi_commit_sv(self):
+        try:    v_pa = max(self._PRESS_MIN, min(self._PRESS_MAX, float(self._hmi_sv_e.text())))
+        except: v_pa = self._pv_to_pa(self._sv_pct)
+        self._sv_pct = self._pa_to_pct(v_pa)
+        self._hmi_sv_e.setText(f"{v_pa:.2f}")
+        if hasattr(self, "_sv_in"): self._sv_in.setText(f"{v_pa:.2f}")
+
+    def _update_hmi(self):
+        if not hasattr(self, "_hmi_pv"): return
+        pa    = self._pv_to_pa(self._pv_n * 100.0)
+        sv_pa = self._pv_to_pa(self._sv_pct)
+        hz    = self._mv_to_hz(self._last_cv * 100.0)
+        self._hmi_pv.setText(f"{pa:.2f} Pa")
+        self._hmi_auto_out.setText(f"{hz:.1f} Hz")
+        if not self._hmi_sv_e.hasFocus():     self._hmi_sv_e.setText(f"{sv_pa:.2f}")
+        if not self._hmi_man_e.hasFocus():    self._hmi_man_e.setText(f"{self._cv_manual:.1f}")
+        if not self._hmi_mv_max_e.hasFocus(): self._hmi_mv_max_e.setText(f"{self._mv_max:.0f}")
+        if not self._hmi_mv_min_e.hasFocus(): self._hmi_mv_min_e.setText(f"{self._mv_min:.0f}")
+        if not self._hmi_kp_e.hasFocus():     self._hmi_kp_e.setText(f"{self._Kp:.3f}")
+        if not self._hmi_ki_e.hasFocus():     self._hmi_ki_e.setText(f"{self._Ki:.4f}")
+        if not self._hmi_kd_e.hasFocus():     self._hmi_kd_e.setText(f"{self._Kd:.4f}")
+        self._refresh_hmi_mode_btns()
 
     # ════════════════════════════════════════════════════
     #  BUILD OVERRIDES
@@ -166,7 +296,7 @@ class VfdPressureTuner(PidTunerBuddy):
         self._hover_lbl.setVisible(True)
 
     def _build_live_strip(self, lay):
-        """Pa-labelled PV/SV strip  →  large Pa/Hz panel  →  gauge animation."""
+        """Pa-labelled PV/SV strip  →  large Pa/Hz panel."""
         # ── Pa live strip ─────────────────────────────────────────
         f = QFrame()
         f.setStyleSheet(f"QFrame{{background:{self._CELL};"
@@ -262,30 +392,6 @@ class VfdPressureTuner(PidTunerBuddy):
         outer.addLayout(hz_col, 1)
         lay.addWidget(f)
 
-        # ── Animation launch button ───────────────────────────────
-        anim_btn = QPushButton("⚡  開啟泵浦動畫  Open Pump Animation")
-        anim_btn.setFixedHeight(32)
-        anim_btn.setStyleSheet(
-            "QPushButton{background:#0D1A12;color:#00CC66;"
-            "border:1px solid #1A4A2A;border-radius:5px;"
-            "font-size:9.5pt;font-weight:700;"
-            "font-family:'Microsoft JhengHei','Segoe UI';}"
-            "QPushButton:hover{background:#143A20;color:#00FF88;"
-            "border-color:#2A6A3A;}")
-        anim_btn.clicked.connect(self._open_anim)
-        lay.addWidget(anim_btn)
-
-    # ── Animation window (lazy-created) ─────────────────────────
-    def _open_anim(self):
-        if not hasattr(self, '_anim_win'):
-            self._anim_win = VfdAnimWindow()
-            scr = self.screen().availableGeometry() if self.screen() else None
-            if scr:
-                self._anim_win.move(
-                    min(self.x() + self.width() + 12, scr.right() - 380),
-                    self.y())
-        self._anim_win.show(); self._anim_win.raise_()
-
     def _build_ctrl_row(self, lay):
         """SV and Init SV accept Pa values; default SV=2.5 Pa, init=0 Pa."""
         self._sv_init = 0.0
@@ -340,5 +446,9 @@ class VfdPressureTuner(PidTunerBuddy):
             self._sv_disp.setText(f"{sv_pa:5.2f}")
             self._pa_disp.setText(f"{pa:6.2f}")
             self._hz_disp.setText(f"{hz:5.1f}")
-            if hasattr(self, '_anim_win') and self._anim_win.isVisible():
-                self._anim_win.update_values(pa, hz, sv_pa)
+
+            # Update embedded animation panel
+            self._pump_canvas.update_values(pa, hz, sv_pa)
+            self._anim_pa_val.setText(f"{pa:.2f} Pa")
+            self._anim_sv_val.setText(f"{sv_pa:.2f} Pa")
+            self._anim_hz_val.setText(f"{hz:.1f} Hz")

@@ -25,8 +25,8 @@ except ImportError:
 from PyQt6.QtCore    import Qt, QTimer, QRect
 from PyQt6.QtGui     import QPainter, QColor, QPen, QPainterPath, QFont, QPixmap
 from PyQt6.QtWidgets import (
-    QWidget, QLabel, QFrame, QVBoxLayout, QHBoxLayout, QGridLayout,
-    QPushButton, QLineEdit, QComboBox, QSizeGrip, QScrollArea, QSlider,
+    QApplication, QWidget, QLabel, QFrame, QVBoxLayout, QHBoxLayout, QGridLayout,
+    QPushButton, QLineEdit, QComboBox, QScrollArea, QSlider,
 )
 
 from styles import BaseToolWindow
@@ -76,7 +76,7 @@ class PidTunerBuddy(BaseToolWindow):
     ]
 
     def __init__(self, on_thinking: Callable = None):
-        super().__init__("⚙️ PID Tuner Station 2.0", 760, 960)
+        super().__init__("⚙️ PID Tuner Station 2.0", 900, 960)
         self.setMinimumSize(640, 700)
         self._on_thinking = on_thinking
 
@@ -129,9 +129,17 @@ class PidTunerBuddy(BaseToolWindow):
         root.setContentsMargins(8, 4, 8, 4)
         root.setSpacing(5)
 
+        h_ctn = QWidget(self.content)
+        h_ctn.setStyleSheet(f"background:{self._BG};")
+        self._h_lay = QHBoxLayout(h_ctn)
+        self._h_lay.setContentsMargins(0, 0, 0, 0)
+        self._h_lay.setSpacing(0)
+        self._hmi_panel = self._build_hmi_panel()
+        self._h_lay.addWidget(self._hmi_panel, 1)
+        self._h_lay.addWidget(scroll, 4)
         outer = QVBoxLayout(self.content)
         outer.setContentsMargins(0, 0, 0, 0)
-        outer.addWidget(scroll)
+        outer.addWidget(h_ctn)
 
         # ── Build sections ────────────────────────────────
         self._build_plot(root)              # 1. trend
@@ -199,6 +207,19 @@ class PidTunerBuddy(BaseToolWindow):
         legend.setLabelTextColor(self._LBL)
         lay.addWidget(pw, 3)
         self._pw = pw
+
+        # Watermark
+        _wm = pg.TextItem(
+            html='<div style="color:rgba(180,180,180,30);font-size:26pt;font-weight:700;'
+                 'font-family:\'Microsoft JhengHei\',\'Segoe UI\',sans-serif;'
+                 'white-space:nowrap;">亞聖國際科技有限公司</div>',
+            anchor=(0.5, 0.5))
+        pw.addItem(_wm, ignoreBounds=True)
+        def _wm_pos(*_, pw=pw, wm=_wm):
+            vr = pw.viewRange()
+            wm.setPos((vr[0][0] + vr[0][1]) / 2, (vr[1][0] + vr[1][1]) / 2)
+        pw.getPlotItem().vb.sigRangeChanged.connect(_wm_pos)
+        _wm_pos()
 
         # Vertical crosshair
         self._xhair = pg.InfiniteLine(
@@ -940,6 +961,7 @@ class PidTunerBuddy(BaseToolWindow):
         self._mv_mode_lbl.setText(
             "MV  現在值 (手動)" if manual else "MV  現在值 (自動)")
         self._refresh_mode_btns()
+        self._refresh_hmi_mode_btns()
 
     def _refresh_mode_btns(self):
         _on = (f"QPushButton{{background:{self._ACC};color:#000;"
@@ -1246,6 +1268,183 @@ class PidTunerBuddy(BaseToolWindow):
                 self._peak_disp.setText(f"peak  {oss:.1f} %OS")
             else:
                 self._peak_disp.setText(f"peak  {self._peak_pv*100:.2f}%")
+            self._update_hmi()
+
+    # ════════════════════════════════════════════════════
+    #  INDUSTRIAL HMI PANEL
+    # ════════════════════════════════════════════════════
+    def _build_hmi_panel(self) -> QFrame:
+        """Industrial HMI faceplate: editable PV/SV/mode/output/PID."""
+        ROW_H = 56
+        LBL_W = 88
+
+        panel = QFrame()
+        panel.setMinimumWidth(190)
+        panel.setMaximumWidth(340)
+        panel.setStyleSheet(
+            "QFrame{background:#0A0A0A;"
+            "border:3px solid #00AAAA;"
+            "border-radius:5px;}")
+
+        lay = QVBoxLayout(panel)
+        lay.setContentsMargins(4, 4, 4, 4)
+        lay.setSpacing(1)
+
+        def _lbl_frame(label: str) -> QFrame:
+            lf = QFrame(); lf.setMinimumWidth(LBL_W); lf.setMaximumWidth(LBL_W + 40)
+            lf.setStyleSheet("QFrame{background:#1E1E1E;border:none;border-radius:2px;}")
+            ll = QVBoxLayout(lf); ll.setContentsMargins(3, 2, 3, 2)
+            lt = QLabel(label); lt.setWordWrap(True)
+            lt.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            lt.setStyleSheet(
+                "color:#DDDDDD;font-size:8.5pt;font-weight:700;"
+                "background:transparent;border:none;"
+                "font-family:'Microsoft JhengHei','Segoe UI';")
+            ll.addWidget(lt)
+            return lf
+
+        def _wrap(lf, vf):
+            rf = QFrame(); rf.setFixedHeight(ROW_H)
+            rf.setStyleSheet("QFrame{background:transparent;border:none;}")
+            h = QHBoxLayout(rf); h.setContentsMargins(0, 0, 0, 0); h.setSpacing(1)
+            h.addWidget(lf); h.addWidget(vf, 1)
+            lay.addWidget(rf)
+
+        def _row_ro(label: str, val_bg: str, val_clr: str) -> QLabel:
+            lf = _lbl_frame(label)
+            vf = QFrame()
+            vf.setStyleSheet(f"QFrame{{background:{val_bg};border:none;border-radius:2px;}}")
+            vl = QVBoxLayout(vf); vl.setContentsMargins(4, 2, 4, 2)
+            vt = QLabel("—"); vt.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            vt.setStyleSheet(
+                f"color:{val_clr};font-size:14pt;font-weight:700;"
+                "background:transparent;border:none;"
+                "font-family:Consolas,'Courier New';")
+            vl.addWidget(vt)
+            _wrap(lf, vf)
+            return vt
+
+        def _row_edit(label: str, val_bg: str, val_clr: str, init: str) -> QLineEdit:
+            lf = _lbl_frame(label)
+            vf = QFrame()
+            vf.setStyleSheet(f"QFrame{{background:{val_bg};border:none;border-radius:2px;}}")
+            vl = QVBoxLayout(vf); vl.setContentsMargins(4, 2, 4, 2)
+            le = QLineEdit(init)
+            le.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            le.setStyleSheet(
+                f"QLineEdit{{background:transparent;color:{val_clr};"
+                f"border:none;font-size:14pt;font-weight:700;"
+                f"font-family:Consolas,'Courier New';}}"
+                f"QLineEdit:focus{{border-bottom:2px solid #00AAAA;}}")
+            vl.addWidget(le)
+            _wrap(lf, vf)
+            return le
+
+        def _mode_row():
+            lf = _lbl_frame("手自動")
+            vf = QFrame()
+            vf.setStyleSheet("QFrame{background:#0F0F0F;border:none;border-radius:2px;}")
+            vh = QHBoxLayout(vf); vh.setContentsMargins(4, 8, 4, 8); vh.setSpacing(4)
+            ba = QPushButton("Auto");   ba.setFixedHeight(34)
+            bm = QPushButton("Manual"); bm.setFixedHeight(34)
+            ba.clicked.connect(lambda: self._set_mode(False))
+            bm.clicked.connect(lambda: self._set_mode(True))
+            vh.addWidget(ba, 1); vh.addWidget(bm, 1)
+            _wrap(lf, vf)
+            return ba, bm
+
+        self._hmi_pv       = _row_ro  ("PV",       "#FFFFFF", "#0044CC")
+        self._hmi_sv_e     = _row_edit("SV 設定值", "#080820", "#5588FF", f"{self._sv_pct:.1f}")
+        self._hmi_auto_btn, self._hmi_man_btn = _mode_row()
+        self._hmi_man_e    = _row_edit("手動輸出",  "#1A1200", "#FFAA00", f"{self._cv_manual:.1f}")
+        self._hmi_auto_out = _row_ro  ("自動輸出",  "#FFFFFF", "#0044CC")
+        self._hmi_mv_max_e = _row_edit("MV Max",   "#1A1600", "#CCAA00", f"{self._mv_max:.0f}")
+        self._hmi_mv_min_e = _row_edit("MV Min",   "#1A1600", "#CCAA00", f"{self._mv_min:.0f}")
+        self._hmi_kp_e     = _row_edit("P",        "#1A1400", "#DDAA00", f"{self._Kp:.3f}")
+        self._hmi_ki_e     = _row_edit("I",        "#1A1400", "#DDAA00", f"{self._Ki:.4f}")
+        self._hmi_kd_e     = _row_edit("D",        "#1A1400", "#DDAA00", f"{self._Kd:.4f}")
+
+        self._hmi_sv_e.editingFinished.connect(self._hmi_commit_sv)
+        self._hmi_man_e.editingFinished.connect(self._hmi_commit_man_out)
+        self._hmi_mv_max_e.editingFinished.connect(self._hmi_commit_mv_max)
+        self._hmi_mv_min_e.editingFinished.connect(self._hmi_commit_mv_min)
+        self._hmi_kp_e.editingFinished.connect(self._hmi_commit_kp)
+        self._hmi_ki_e.editingFinished.connect(self._hmi_commit_ki)
+        self._hmi_kd_e.editingFinished.connect(self._hmi_commit_kd)
+
+        self._refresh_hmi_mode_btns()
+        lay.addStretch()
+        return panel
+
+    # ── HMI commit handlers (overridable by subclasses) ──────────
+    def _hmi_commit_sv(self):
+        try:    v = max(0.0, min(200.0, float(self._hmi_sv_e.text())))
+        except: v = self._sv_pct
+        self._sv_pct = v;  self._hmi_sv_e.setText(f"{v:.1f}")
+        if hasattr(self, "_sv_in"): self._sv_in.setText(f"{v:.1f}")
+
+    def _hmi_commit_man_out(self):
+        try:    v = max(0.0, min(100.0, float(self._hmi_man_e.text())))
+        except: v = self._cv_manual
+        self._cv_manual = v;  self._hmi_man_e.setText(f"{v:.1f}")
+        if hasattr(self, "_man_cv_in"): self._man_cv_in.setText(f"{v:.1f}")
+
+    def _hmi_commit_mv_max(self):
+        try:    v = max(0.0, min(200.0, float(self._hmi_mv_max_e.text())))
+        except: v = self._mv_max
+        self._mv_max = v;  self._hmi_mv_max_e.setText(f"{v:.0f}")
+        if hasattr(self, "_mv_max_in"): self._mv_max_in.setText(f"{v:.0f}")
+
+    def _hmi_commit_mv_min(self):
+        try:    v = max(0.0, min(200.0, float(self._hmi_mv_min_e.text())))
+        except: v = self._mv_min
+        self._mv_min = v;  self._hmi_mv_min_e.setText(f"{v:.0f}")
+        if hasattr(self, "_mv_min_in"): self._mv_min_in.setText(f"{v:.0f}")
+
+    def _hmi_commit_kp(self):
+        try:    v = max(0.0, min(100.0, float(self._hmi_kp_e.text())))
+        except: v = self._Kp
+        self._Kp = v;  self._hmi_kp_e.setText(f"{v:.3f}")
+        if "Kp" in self._pid_inputs: self._pid_inputs["Kp"].setText(f"{v:.3f}")
+
+    def _hmi_commit_ki(self):
+        try:    v = max(0.0, min(50.0, float(self._hmi_ki_e.text())))
+        except: v = self._Ki
+        self._Ki = v;  self._hmi_ki_e.setText(f"{v:.4f}")
+        if "Ki" in self._pid_inputs: self._pid_inputs["Ki"].setText(f"{v:.4f}")
+
+    def _hmi_commit_kd(self):
+        try:    v = max(0.0, min(20.0, float(self._hmi_kd_e.text())))
+        except: v = self._Kd
+        self._Kd = v;  self._hmi_kd_e.setText(f"{v:.4f}")
+        if "Kd" in self._pid_inputs: self._pid_inputs["Kd"].setText(f"{v:.4f}")
+
+    def _refresh_hmi_mode_btns(self):
+        if not hasattr(self, "_hmi_auto_btn"): return
+        _on  = ("QPushButton{background:#00BB44;color:#000;border:none;border-radius:3px;"
+                "font-size:9.5pt;font-weight:700;"
+                "font-family:'Microsoft JhengHei','Segoe UI';}")
+        _off = ("QPushButton{background:#282828;color:#666;border:1px solid #444;"
+                "border-radius:3px;font-size:9.5pt;font-weight:700;"
+                "font-family:'Microsoft JhengHei','Segoe UI';}"
+                "QPushButton:hover{background:#383838;color:#AAA;}")
+        self._hmi_auto_btn.setStyleSheet(_on if not self._manual_mode else _off)
+        self._hmi_man_btn.setStyleSheet (_on if     self._manual_mode else _off)
+
+    def _update_hmi(self):
+        if not hasattr(self, "_hmi_pv"): return
+        pv_pct = self._pv_n * 100.0
+        cv_pct = self._last_cv * 100.0
+        self._hmi_pv.setText(f"{pv_pct:.1f} %")
+        self._hmi_auto_out.setText(f"{cv_pct:.1f} %")
+        if not self._hmi_sv_e.hasFocus():     self._hmi_sv_e.setText(f"{self._sv_pct:.1f}")
+        if not self._hmi_man_e.hasFocus():    self._hmi_man_e.setText(f"{self._cv_manual:.1f}")
+        if not self._hmi_mv_max_e.hasFocus(): self._hmi_mv_max_e.setText(f"{self._mv_max:.0f}")
+        if not self._hmi_mv_min_e.hasFocus(): self._hmi_mv_min_e.setText(f"{self._mv_min:.0f}")
+        if not self._hmi_kp_e.hasFocus():     self._hmi_kp_e.setText(f"{self._Kp:.3f}")
+        if not self._hmi_ki_e.hasFocus():     self._hmi_ki_e.setText(f"{self._Ki:.4f}")
+        if not self._hmi_kd_e.hasFocus():     self._hmi_kd_e.setText(f"{self._Kd:.4f}")
+        self._refresh_hmi_mode_btns()
 
     def closeEvent(self, e):
         self._sim_timer.stop(); super().closeEvent(e)
@@ -1256,3 +1455,8 @@ class PidTunerBuddy(BaseToolWindow):
     def showEvent(self, e):
         super().showEvent(e)
         if not self._sim_timer.isActive(): self._sim_timer.start(50)
+        scr = QApplication.primaryScreen()
+        if scr:
+            ag = scr.availableGeometry()
+            self.resize(ag.width(), ag.height())
+            self.move(ag.left(), ag.top())
