@@ -1,16 +1,29 @@
 # -*- mode: python ; coding: utf-8 -*-
 
-
 a = Analysis(
     ['Main.py'],
     pathex=[],
     binaries=[],
     datas=[('logo_ys.png', '.'), ('config.json', '.')],
-    hiddenimports=[],
+    hiddenimports=[
+        'pyqtgraph',
+        'pyqtgraph.graphicsItems.ViewBox.ViewBoxMenu',
+        'pyqtgraph.graphicsItems.PlotItem.PlotItem',
+        'pyqtgraph.graphicsItems.LegendItem',
+        'pyqtgraph.graphicsItems.TextItem',
+        'pyqtgraph.graphicsItems.InfiniteLine',
+        'pyqtgraph.graphicsItems.SignalProxy',
+        'pyqtgraph.Qt',
+        'numpy',
+    ],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=['torch', 'scipy', 'pandas', 'PIL', 'numba', 'llvmlite', 'pyarrow', 'sklearn', 'matplotlib', 'tensorflow', 'onnxruntime', 'sympy'],
+    excludes=[
+        'torch', 'scipy', 'pandas', 'PIL', 'numba', 'llvmlite',
+        'pyarrow', 'sklearn', 'matplotlib', 'tensorflow',
+        'onnxruntime', 'sympy', 'IPython', 'jupyter',
+    ],
     noarchive=False,
     optimize=0,
 )
@@ -32,6 +45,7 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+    icon='logo_ys.png',
 )
 coll = COLLECT(
     exe,

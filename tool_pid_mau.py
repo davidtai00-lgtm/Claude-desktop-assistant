@@ -1,0 +1,1768 @@
+# tool_pid_mau.py — MAU 7-Stage PID Simulator  V2
+# OA → HTC-1 → CC-1 → Washer → CC-2 → HTC-2 → Fan
+# All stages have FOPDT; click-to-select; manual MV; editable PV range
+
+import math
+from collections import deque
+from dataclasses import dataclass
+
+from PyQt6.QtCore    import Qt, QTimer, QRect, QPoint, QPointF
+from PyQt6.QtGui     import (QPainter, QColor, QPen, QPainterPath,
+                              QFont, QPolygonF, QBrush, QLinearGradient)
+from PyQt6.QtWidgets import (
+    QApplication, QWidget, QLabel, QFrame,
+    QVBoxLayout, QHBoxLayout, QGridLayout,
+    QPushButton, QLineEdit, QComboBox,
+    QScrollArea, QStackedWidget,
+)
+from styles import BaseToolWindow
+
+
+# ═══════════════════════════════════════════════════════
+#  PSYCHROMETRIC PHYSICS
+# ═══════════════════════════════════════════════════════
+class Psych:
+    P = 101.325
+    @staticmethod
+    def pws(T):  return 0.61078 * math.exp(17.27 * T / (T + 237.3))
+    @staticmethod
+    def omega(T, RH):
+        pw = Psych.pws(T) * max(0.0, min(100.0, RH)) / 100.0
+        return 0.62198 * pw / max(1e-9, Psych.P - pw)
+    @staticmethod
+    def omega_sat(T):  return Psych.omega(T, 100.0)
+    @staticmethod
+    def rh(T, w):
+        pw = w * Psych.P / (0.62198 + w)
+        return min(100.0, pw / max(1e-9, Psych.pws(T)) * 100.0)
+    @staticmethod
+    def enthalpy(T, w):  return 1.006 * T + w * (2501.0 + 1.86 * T)
+    @staticmethod
+    def t_dp(w):
+        pw = w * Psych.P / (0.62198 + w)
+        if pw <= 0: return -50.0
+        r = math.log(pw / 0.61078)
+        return 237.3 * r / (17.27 - r)
+    @staticmethod
+    def t_wb(T_db, w):
+        h_in = Psych.enthalpy(T_db, w)
+        lo = max(-10.0, Psych.t_dp(w)); hi = T_db
+        for _ in range(40):
+            mid = (lo + hi) * 0.5
+            if Psych.enthalpy(mid, Psych.omega_sat(mid)) < h_in: lo = mid
+            else: hi = mid
+        return (lo + hi) * 0.5
+
+
+@dataclass
+class AirState:
+    T: float = 20.0;  w: float = 0.008
+    def copy(self):       return AirState(self.T, self.w)
+    @property
+    def RH(self):         return Psych.rh(self.T, self.w)
+    @property
+    def h(self):          return Psych.enthalpy(self.T, self.w)
+    @property
+    def T_dp(self):       return Psych.t_dp(self.w)
+    @property
+    def T_wb(self):       return Psych.t_wb(self.T, self.w)
+    @property
+    def w_gkg(self):      return self.w * 1000.0
+
+
+# ═══════════════════════════════════════════════════════
+#  PID CONTROLLER
+# ═══════════════════════════════════════════════════════
+class PidCtrl:
+    def __init__(self, Kp, Ki, Kd, reverse=False, mv_lo=0.0, mv_hi=100.0):
+        self.Kp = Kp; self.Ki = Ki; self.Kd = Kd
+        self.reverse = reverse; self.mv_lo = mv_lo; self.mv_hi = mv_hi
+        self._int = 0.0; self._prev_e = 0.0
+        self.auto = True; self.manual_mv = (mv_lo + mv_hi) / 2.0
+        self._mv = self.manual_mv
+    def reset(self, mv=None):
+        self._int = 0.0; self._prev_e = 0.0
+        self._mv = mv if mv is not None else self.manual_mv
+    def compute(self, PV, SP, dt):
+        if not self.auto:
+            self._mv = max(self.mv_lo, min(self.mv_hi, self.manual_mv)); return self._mv
+        e = (SP - PV) if self.reverse else (PV - SP)
+        if self.Ki > 1e-9:
+            ilim = (self.mv_hi - self.mv_lo) / self.Ki
+            self._int = max(-ilim, min(ilim, self._int + e * dt))
+        de = (e - self._prev_e) / max(dt, 1e-6); self._prev_e = e
+        self._mv = max(self.mv_lo, min(self.mv_hi,
+                       self.Kp * e + self.Ki * self._int + self.Kd * de))
+        return self._mv
+    @property
+    def mv(self): return self._mv
+
+
+# ═══════════════════════════════════════════════════════
+#  FOPDT COIL / STAGE MODEL
+# ═══════════════════════════════════════════════════════
+class FopdtCoil:
+    def __init__(self, Kp, tau, L, heating=True, dt=0.05):
+        self.Kp = Kp; self.tau = tau; self.L = L; self.heating = heating
+        self._dT = 0.0
+        n = max(1, round(L / dt))
+        self._buf: deque = deque([0.0] * n, maxlen=n)
+    def reset(self):
+        self._dT = 0.0
+        n = self._buf.maxlen; self._buf = deque([0.0] * n, maxlen=n)
+    def step(self, MV, dt, fan_scale=1.0):
+        self._buf.append(MV); mv_d = self._buf[0]
+        alpha = min(1.0, dt / max(self.tau, 1e-3))
+        sign = 1.0 if self.heating else -1.0
+        self._dT += alpha * (self.Kp * fan_scale * mv_d * sign - self._dT)
+        return self._dT
+
+
+# ═══════════════════════════════════════════════════════
+#  STAGE METADATA
+# ═══════════════════════════════════════════════════════
+_SNAMES = ["OA\nINLET", "HTC-1\nPREHEAT", "CC-1\nPRECOOL",
+           "WASHER\nHUMIDIFY", "CC-2\nDEHUMID", "HTC-2\nREHEAT", "SUPPLY\nFAN"]
+_SBGCLR = ["#060C1C","#1C0A04","#040C1C","#041410","#040A1C","#14090A","#07051A"]
+_SACCNT = ["#3D8EFF","#FF6B35","#00D4FF","#00FF9F","#2E86FF","#FFB300","#BB77FF"]
+
+
+# ═══════════════════════════════════════════════════════
+#  SCHEMATIC  (top painter widget)
+# ═══════════════════════════════════════════════════════
+class _MauSchematic(QWidget):
+    def __init__(self, select_cb=None, parent=None):
+        super().__init__(parent)
+        self.setMinimumHeight(220); self._states = [AirState(6.0, 0.003)] * 7
+        self._mvs = [0.0]*6; self._p_static = 2000.0; self._fan_hz = 45.0
+        self._angle = 0.0; self._sel = -1; self._select_cb = select_cb
+
+    def set_selected(self, stage_idx: int):
+        self._sel = stage_idx; self.update()
+
+    def stage_connect_points(self):
+        """Return (center_x, box_bottom_y) for each of the 7 stage boxes in widget coords."""
+        W, H = self.width(), self.height()
+        n = 7; mg = 10; GAP = 22
+        LBL_H = 30; STRIP_H = 108; STAT_H = 26
+        avail_bw = W - 2*mg - (n-1)*GAP
+        bw = max(60, avail_bw // n)
+        box_bot = H - STRIP_H - STAT_H - 2
+        return [(mg + i*(bw+GAP) + bw//2, box_bot) for i in range(n)]
+
+    def isa_instrument_positions(self):
+        """Return 6 (cx, cy) in widget coords for ISA circles — one per faceplate (fp[0..5])."""
+        W, H = self.width(), self.height()
+        n = 7; mg = 10; GAP = 22
+        LBL_H = 30; STRIP_H = 108; STAT_H = 26
+        avail_bw = W - 2*mg - (n-1)*GAP
+        bw = max(60, avail_bw // n)
+        box_top = mg + LBL_H + 2
+        box_bot = H - STRIP_H - STAT_H - 2
+        bh = max(80, box_bot - box_top)
+        r_s = 9
+        isa_y = box_top + bh // 2
+        # fp[0..2]: gap positions 2-4 (outlet of HTC1, CC1, Washer)
+        pts = [(mg + i*(bw+GAP) - GAP//2, isa_y) for i in range(2, 5)]
+        # fp[3] (CC-2 DP), fp[4] (HTC-2 T), fp[5] (Fan P) at far right
+        ix_fan  = W - mg - r_s - 2
+        ix_htc2 = ix_fan  - 2*r_s - 6
+        ix_cc2  = ix_htc2 - 2*r_s - 6
+        pts.append((ix_cc2,  isa_y))
+        pts.append((ix_htc2, isa_y))
+        pts.append((ix_fan,  isa_y))
+        return pts
+
+    def refresh(self, states, mvs, p_static, fan_hz):
+        self._states = states; self._mvs = mvs
+        self._p_static = p_static; self._fan_hz = fan_hz
+        self._angle = (self._angle + fan_hz * 0.5) % 360.0
+        self.update()
+
+    def mousePressEvent(self, e):
+        W = self.width(); n = 7; mg = 6; sp = 4
+        bw = max(50, (W - 2*mg - (n-1)*sp) // n)
+        xi = int((e.position().x() - mg) / (bw + sp))
+        xi = max(0, min(n-1, xi))
+        if self._select_cb: self._select_cb(xi)
+        super().mousePressEvent(e)
+
+    def paintEvent(self, _):
+        p = QPainter(self); p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        W, H = self.width(), self.height()
+        p.fillRect(0, 0, W, H, QColor("#060A1A"))
+
+        n = 7; mg = 10; GAP = 22
+        LBL_H = 30; STRIP_H = 108; STAT_H = 26
+        avail_bw = W - 2*mg - (n-1)*GAP
+        bw = max(60, avail_bw // n)
+        box_top = mg + LBL_H + 2
+        box_bot = H - STRIP_H - STAT_H - 2
+        bh = max(80, box_bot - box_top)
+
+        # Stage label rectangles
+        stage_lbls = ["OA INLET","HTC-1","CC-1","WASHER","CC-2","HTC-2","SUPPLY FAN"]
+        for i in range(n):
+            x = mg + i*(bw+GAP)
+            p.setPen(QPen(QColor("#263850"), 1))
+            p.setBrush(QColor("#0C1826"))
+            p.drawRoundedRect(x, mg, bw, LBL_H-2, 3, 3)
+            p.setPen(QPen(QColor("#B8C8D8")))
+            p.setFont(QFont("Consolas", 8, QFont.Weight.Bold))
+            p.drawText(QRect(x, mg, bw, LBL_H-2), Qt.AlignmentFlag.AlignCenter, stage_lbls[i])
+
+        # Stage boxes + graphics + MV bar
+        MV_BW = 8   # MV indicator bar width
+        for i in range(n):
+            x = mg + i*(bw+GAP); sel = (i == self._sel)
+            acc = QColor(_SACCNT[i])
+            p.setPen(QPen(acc if sel else QColor("#1A2A3E"), 2.0 if sel else 1.0))
+            p.setBrush(QColor("#07101C"))
+            p.drawRoundedRect(x, box_top, bw, bh, 3, 3)
+            if sel:
+                p.setPen(Qt.PenStyle.NoPen); p.setBrush(acc)
+                p.drawRoundedRect(x+2, box_top+bh-5, bw-4, 5, 2, 2)
+            mv_i = (self._mvs[i-1] if 1 <= i <= 5 else
+                    (self._mvs[5] if i == 6 else 0.0))
+            self._draw_unit(p, i, x, box_top, bw, bh, mv_i)
+
+            # MV fill bar — right edge, fills bottom-up proportional to MV%
+            if 1 <= i <= 6:
+                bx_mv = x + bw - MV_BW - 3
+                track_y = box_top + 6; track_h = bh - 12
+                p.setPen(Qt.PenStyle.NoPen); p.setBrush(QColor("#040810"))
+                p.drawRoundedRect(bx_mv, track_y, MV_BW, track_h, 2, 2)
+                fill_h = max(2, int(track_h * mv_i / 100.0))
+                gv = QLinearGradient(bx_mv, track_y+track_h-fill_h, bx_mv, track_y+track_h)
+                gv.setColorAt(0, QColor(acc.red(), acc.green(), acc.blue(), 220))
+                gv.setColorAt(1, QColor(acc.red()//2, acc.green()//2, acc.blue()//2, 140))
+                p.setBrush(QBrush(gv))
+                p.drawRoundedRect(bx_mv, track_y+track_h-fill_h, MV_BW, fill_h, 2, 2)
+                p.setFont(QFont("Consolas", 6, QFont.Weight.Bold))
+                p.setPen(QPen(QColor(acc.red(), acc.green(), acc.blue(), 200)))
+                p.drawText(QRect(bx_mv-8, track_y+track_h+1, MV_BW+16, 10),
+                           Qt.AlignmentFlag.AlignCenter, f"{mv_i:.0f}%")
+
+        # ISA instrument circles — 6 instruments for fp[0..5]
+        # fp[0..3]: outlet gaps 2-5; fp[4] HTC-2 T, fp[5] Fan P at far right
+        pv_types_list  = ["T", "T", "RH", "DP", "T", "P"]
+        pv_colors_list = ["#FF6B35", "#00D4FF", "#00FF9F", "#2E86FF", "#FFB300", "#BB77FF"]
+        r_s = 9
+        isa_pts_draw = self.isa_instrument_positions()
+
+        def _draw_isa(px, py, clr, label, stem_to=None):
+            c = QColor(clr)
+            if stem_to is not None:
+                p.setPen(QPen(c, 1.0, Qt.PenStyle.DashLine))
+                p.drawLine(px, py + r_s, px, stem_to)
+            p.setPen(QPen(c, 1.5)); p.setBrush(QColor("#050D1A"))
+            p.drawEllipse(px-r_s, py-r_s, 2*r_s, 2*r_s)
+            p.setPen(QPen(c, 0.9))
+            p.drawLine(px-r_s+2, py, px+r_s-2, py)
+            p.drawLine(px, py-r_s+2, px, py+r_s-2)
+            p.setFont(QFont("Consolas", 6, QFont.Weight.Bold)); p.setPen(QPen(c))
+            p.drawText(QRect(px-r_s, py-r_s, 2*r_s, 2*r_s),
+                       Qt.AlignmentFlag.AlignCenter, label)
+
+        for fi, ((ix, iy), pv_t, pv_c) in enumerate(
+                zip(isa_pts_draw, pv_types_list, pv_colors_list)):
+            _draw_isa(ix, iy, pv_c, pv_t)
+
+        # Data strip
+        strip_y = H - STRIP_H - STAT_H
+        p.fillRect(0, strip_y, W, STRIP_H, QColor("#050810"))
+        p.setPen(QPen(QColor("#1A2840"), 1)); p.drawLine(0, strip_y, W, strip_y)
+        main_lbls = ["OUTDOOR AIR","DRY BULB","DRY BULB","HUMIDITY","DEW POINT","DRY BULB","STATIC PRESSURE"]
+        for i in range(n):
+            x = mg + i*(bw+GAP); s = self._states[i]; sel = (i == self._sel)
+            acc = QColor(_SACCNT[i])
+            if i < n-1:
+                p.setPen(QPen(QColor("#1A2840"), 1))
+                p.drawLine(x+bw+GAP//2, strip_y+4, x+bw+GAP//2, strip_y+STRIP_H-4)
+            # Row 1 — label
+            p.setFont(QFont("Consolas", 7, QFont.Weight.Bold))
+            p.setPen(QPen(QColor("#5A7090")))
+            p.drawText(QRect(x, strip_y+5, bw, 15), Qt.AlignmentFlag.AlignCenter, main_lbls[i])
+            # Row 2 — primary value (large)
+            if i == 0:   pv = f"{s.T:.1f}°C"
+            elif i == 3: pv = f"{s.RH:.0f}% RH"
+            elif i == 6: pv = f"{self._p_static:.0f} Pa"
+            else:        pv = f"{s.T:.1f}°C"
+            p.setFont(QFont("Consolas", 15, QFont.Weight.Bold))
+            p.setPen(QPen(QColor("#FFFFFF") if sel else acc))
+            p.drawText(QRect(x, strip_y+18, bw, 34), Qt.AlignmentFlag.AlignCenter, pv)
+            # Row 3+4 — secondary values
+            if i == 0:   sv1, sv2 = f"{s.RH:.0f} % RH", f"{s.w_gkg:.1f} g/kg"
+            elif i == 1: sv1, sv2 = f"{s.h:.1f} kJ/kg", f"{s.w_gkg:.1f} g/kg"
+            elif i == 2: sv1, sv2 = f"{s.h:.1f} kJ/kg", f"{s.w_gkg:.1f} g/kg"
+            elif i == 3: sv1, sv2 = f"{s.T:.1f} °C DB", f"{s.w_gkg:.1f} g/kg"
+            elif i == 4: sv1, sv2 = f"{s.w_gkg:.1f} g/kg", f"{s.T_dp:.1f} °C DB"
+            elif i == 5: sv1, sv2 = f"{s.h:.1f} kJ/kg", f"{s.w_gkg:.1f} g/kg"
+            else:        sv1, sv2 = f"{self._fan_hz:.1f} Hz", ""
+            p.setFont(QFont("Consolas", 8)); p.setPen(QPen(QColor("#7A8EA8")))
+            p.drawText(QRect(x, strip_y+52, bw, 16), Qt.AlignmentFlag.AlignCenter, sv1)
+            if sv2:
+                p.drawText(QRect(x, strip_y+68, bw, 16), Qt.AlignmentFlag.AlignCenter, sv2)
+
+        # Status bar
+        sb_y = H - STAT_H
+        p.fillRect(0, sb_y, W, STAT_H, QColor("#040710"))
+        p.setPen(QPen(QColor("#1A2840"), 1)); p.drawLine(0, sb_y, W, sb_y)
+        p.setFont(QFont("Consolas", 8, QFont.Weight.Bold))
+        p.setPen(QPen(QColor("#3A5A7A")))
+        p.drawText(QRect(mg, sb_y, 200, STAT_H), Qt.AlignmentFlag.AlignVCenter, "STAGE CONTROLLERS")
+        fm = p.fontMetrics()
+        parts = [("● SYSTEM STATIC PRESSURE:  ","#3A5A7A"),
+                 (f"{self._p_static:.0f} PA","#00D4FF"),
+                 ("   ● FAN SPEED:  ","#3A5A7A"),
+                 (f"{self._fan_hz:.1f} HZ","#FFBB00")]
+        tw = sum(fm.horizontalAdvance(t) for t,_ in parts)
+        cx2 = W - mg - tw
+        ty = sb_y + (STAT_H - fm.height())//2 + fm.ascent()
+        for txt, clr in parts:
+            p.setPen(QPen(QColor(clr))); p.drawText(cx2, ty, txt)
+            cx2 += fm.horizontalAdvance(txt)
+
+        # Company watermark — on top, auto-sized to span full width
+        wm_txt = "亞聖國際科技有限公司"
+        for fs in range(60, 10, -2):
+            p.setFont(QFont("Microsoft JhengHei", fs, QFont.Weight.Bold))
+            if p.fontMetrics().horizontalAdvance(wm_txt) <= W - 20:
+                break
+        fm_wm = p.fontMetrics()
+        wm_x = (W - fm_wm.horizontalAdvance(wm_txt)) // 2
+        wm_cy = (box_top + box_bot) // 2
+        p.setPen(QPen(QColor(0, 180, 220, 42)))
+        p.drawText(wm_x, wm_cy + fm_wm.ascent() // 2, wm_txt)
+        p.end()
+
+    def _draw_unit(self, p, idx, x, y, w, h, mv):
+        cx = x+w//2; cy = y+h//2
+
+        if idx == 0:  # OA INLET — chevron grid (like air louvres)
+            rows = 6; cols = 2
+            rh2 = (h-16)//rows; cw2 = (w-12)//cols
+            for r in range(rows):
+                ry = y+8+r*rh2+rh2//2
+                for c in range(cols):
+                    bx2 = x+6+c*cw2
+                    p.setPen(QPen(QColor("#2A4060"), 1.2))
+                    p.drawLine(bx2, ry, bx2+cw2//2-8, ry)
+                    tip = bx2+cw2//2-2
+                    p.setPen(QPen(QColor("#3A5878"), 1.8, Qt.PenStyle.SolidLine,
+                                  Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
+                    p.drawLine(tip-7, ry-5, tip, ry); p.drawLine(tip, ry, tip-7, ry+5)
+
+        elif idx in (1, 5):  # HTC — narrow gradient bar + "+" circle
+            bar_w = max(16, w//3); bx2 = cx-bar_w//2
+            by2 = y+14; bh2 = h-28
+            grad = QLinearGradient(bx2, by2, bx2, by2+bh2)
+            if idx == 1:  # red
+                grad.setColorAt(0.0, QColor("#1A0300")); grad.setColorAt(0.35, QColor("#991A00"))
+                grad.setColorAt(0.5, QColor("#CC3300")); grad.setColorAt(0.65, QColor("#991A00"))
+                grad.setColorAt(1.0, QColor("#1A0300"))
+            else:  # amber
+                grad.setColorAt(0.0, QColor("#1A0E00")); grad.setColorAt(0.35, QColor("#885500"))
+                grad.setColorAt(0.5, QColor("#BB7700")); grad.setColorAt(0.65, QColor("#885500"))
+                grad.setColorAt(1.0, QColor("#1A0E00"))
+            p.setPen(Qt.PenStyle.NoPen); p.setBrush(QBrush(grad))
+            p.drawRoundedRect(bx2, by2, bar_w, bh2, 3, 3)
+            p.setPen(QPen(QColor(255,255,255,20), 0.8))
+            for fi in range(bh2//7):
+                p.drawLine(bx2+2, by2+fi*7+3, bx2+bar_w-2, by2+fi*7+3)
+            rv = min(18, w//3, h//5)
+            circ = QColor("#FF3300") if idx==1 else QColor("#FF9900")
+            p.setPen(Qt.PenStyle.NoPen); p.setBrush(circ)
+            p.drawEllipse(cx-rv, cy-rv, 2*rv, 2*rv)
+            p.setPen(QPen(QColor("#FFFFFF"), 2.5))
+            p.drawLine(cx-rv+5, cy, cx+rv-5, cy); p.drawLine(cx, cy-rv+5, cx, cy+rv-5)
+
+        elif idx == 2:  # CC-1 — vertical gradient fins + "−" circle
+            nf = max(2, (w-12)//12); fw = max(3, (w-12)//(nf+1))
+            p.setPen(Qt.PenStyle.NoPen)
+            for fi in range(nf):
+                fx = x+6+fi*(fw+4)
+                gf = QLinearGradient(fx, y+10, fx, y+h-10)
+                cv = int(50+140*(mv/100.0))
+                gf.setColorAt(0, QColor(0,15,70)); gf.setColorAt(0.5, QColor(0,cv,210))
+                gf.setColorAt(1, QColor(0,15,70))
+                p.setBrush(QBrush(gf)); p.drawRoundedRect(fx, y+10, fw, h-20, 1, 1)
+            rv = min(18, w//3, h//5); cv2 = int(80+140*(mv/100.0))
+            p.setPen(Qt.PenStyle.NoPen); p.setBrush(QColor(0, cv2, 220))
+            p.drawEllipse(cx-rv, cy-rv, 2*rv, 2*rv)
+            p.setPen(QPen(QColor("#FFFFFF"), 2.5))
+            p.drawLine(cx-rv+5, cy, cx+rv-5, cy)
+
+        elif idx == 3:  # WASHER — gray body + nozzles + level line
+            bdy_w = max(20, w*6//10); bdy_h = h-20
+            bx2 = cx-bdy_w//2; bdy_y = y+10
+            p.setPen(QPen(QColor("#3A4A5A"), 1.5)); p.setBrush(QColor("#131D2A"))
+            p.drawRoundedRect(bx2, bdy_y, bdy_w, bdy_h, 4, 4)
+            p.setPen(Qt.PenStyle.NoPen); p.setBrush(QColor("#1B2738"))
+            p.drawRoundedRect(bx2+4, bdy_y+4, bdy_w-8, bdy_h-8, 2, 2)
+            lv_y = bdy_y + bdy_h//2
+            p.setPen(QPen(QColor("#B0C0D0"), 1.5))
+            p.drawLine(bx2+6, lv_y, bx2+bdy_w-6, lv_y)
+            alpha = min(255, int(50+200*(mv/100.0)))
+            p.setPen(Qt.PenStyle.NoPen); p.setBrush(QColor(70,140,210,alpha))
+            for ni in range(3):
+                nz_x = bx2+bdy_w//4+ni*(bdy_w//4)
+                p.drawEllipse(nz_x-3, bdy_y+8-3, 6, 6)
+            p.setPen(QPen(QColor(70,150,220,alpha), 0.8))
+            for ni in range(3):
+                nz_x = bx2+bdy_w//4+ni*(bdy_w//4)
+                for j in range(3):
+                    p.drawLine(nz_x, bdy_y+14, nz_x+(j-1)*4, bdy_y+14+j*16)
+
+        elif idx == 4:  # CC-2 — diagonal cross-hatch blue + "−" circle
+            p.save(); p.setClipRect(x+2, y+2, w-4, h-4)
+            step = 14
+            for off in range(-h, w+h, step):
+                pg = QLinearGradient(x+off, y, x+off+h, y+h)
+                pg.setColorAt(0, QColor(0,50,140,150)); pg.setColorAt(1, QColor(0,90,190,90))
+                p.setPen(QPen(QBrush(pg), 2.0))
+                p.drawLine(x+off, y, x+off+h, y+h)
+                p.drawLine(x+off+h, y, x+off, y+h)
+            p.restore()
+            rv = min(18, w//3, h//5); cv3 = int(80+140*(mv/100.0))
+            p.setPen(Qt.PenStyle.NoPen); p.setBrush(QColor(0, cv3, 220))
+            p.drawEllipse(cx-rv, cy-rv, 2*rv, 2*rv)
+            p.setPen(QPen(QColor("#FFFFFF"), 2.5))
+            p.drawLine(cx-rv+5, cy, cx+rv-5, cy)
+
+        elif idx == 6:  # Supply Fan — large circle + single blade + motor + chevrons
+            fan_w = w*6//10; fan_cx = x+fan_w//2; fan_cy = cy
+            rf = min(fan_w//2-4, h//2-8)
+            p.setPen(QPen(QColor("#3A5A7A"), 1.8)); p.setBrush(QColor("#081018"))
+            p.drawEllipse(fan_cx-rf, fan_cy-rf, 2*rf, 2*rf)
+            ang = math.radians(self._angle)
+            bx0 = fan_cx+int(rf*0.85*math.cos(ang+math.pi))
+            by0 = fan_cy+int(rf*0.85*math.sin(ang+math.pi))
+            bx1 = fan_cx+int(rf*0.85*math.cos(ang))
+            by1 = fan_cy+int(rf*0.85*math.sin(ang))
+            p.setPen(QPen(QColor("#5A8AB0"), 2.5)); p.drawLine(bx0, by0, bx1, by1)
+            p.setPen(Qt.PenStyle.NoPen); p.setBrush(QColor("#7AAAD0"))
+            p.drawEllipse(fan_cx-4, fan_cy-4, 8, 8)
+            mh_w = max(14, fan_w//3); mh_h = max(10, rf//3)
+            mh_x = fan_cx+rf//2; mh_y = fan_cy+rf//2
+            p.setPen(QPen(QColor("#385068"), 1.2)); p.setBrush(QColor("#0E1A2C"))
+            p.drawRect(mh_x, mh_y, mh_w, mh_h)
+            p.setFont(QFont("Microsoft JhengHei", 7)); p.setPen(QPen(QColor("#5A7A9A")))
+            p.drawText(QRect(mh_x, mh_y-14, mh_w, 14), Qt.AlignmentFlag.AlignCenter, "馬達")
+            p.setPen(Qt.PenStyle.NoPen); p.setBrush(QColor("#CC9900"))
+            for ti in range(2):
+                tx = fan_cx-rf//2+ti*rf
+                p.drawPolygon(QPolygonF([QPointF(float(tx-8),float(y+h-2)),
+                                         QPointF(float(tx+8),float(y+h-2)),
+                                         QPointF(float(tx),  float(y+h-10))]))
+            chev_x0 = x+fan_w+4; chev_w = w-fan_w-6
+            for r in range(5):
+                ry2 = y+8+r*((h-16)//5)+(h-16)//10
+                p.setPen(QPen(QColor("#2A4060"), 1.5, Qt.PenStyle.SolidLine,
+                              Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
+                tip2 = chev_x0+chev_w//2+4
+                p.drawLine(tip2-7, ry2-5, tip2, ry2); p.drawLine(tip2, ry2, tip2-7, ry2+5)
+
+
+# ═══════════════════════════════════════════════════════
+#  PSYCHROMETRIC CHART
+# ═══════════════════════════════════════════════════════
+class _PsychrometricChart(QWidget):
+    T_MIN, T_MAX = 0.0, 50.0
+    W_MIN, W_MAX = 0.0, 0.030
+
+    def __init__(self, parent=None):
+        super().__init__(parent); self.setMinimumSize(300, 280)
+        self._states = [AirState(6.0, 0.003)] * 7
+        self._T_sp = 22.0; self._RH_sp = 50.0
+        self._T_tol = 2.0; self._RH_tol = 5.0
+        self._sel = -1
+
+    def refresh(self, states, T_sp, RH_sp, T_tol, RH_tol, sel=-1):
+        self._states = states; self._T_sp = T_sp; self._RH_sp = RH_sp
+        self._T_tol = T_tol; self._RH_tol = RH_tol; self._sel = sel
+        self.update()
+
+    def _xy(self, T, w):
+        lm, rm, tm, bm = 42, 10, 10, 32
+        W, H = self.width(), self.height()
+        pw = W-lm-rm; ph = H-tm-bm
+        x = lm + (T-self.T_MIN)/(self.T_MAX-self.T_MIN)*pw
+        y = (H-bm) - (w-self.W_MIN)/(self.W_MAX-self.W_MIN)*ph
+        return int(x), int(y)
+
+    def paintEvent(self, _):
+        p = QPainter(self); p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        W, H = self.width(), self.height()
+        p.fillRect(0, 0, W, H, QColor("#04091A"))
+
+        # Grid
+        p.setPen(QPen(QColor(14, 30, 58), 1))
+        for T in range(0, 55, 5):
+            x, _ = self._xy(T, 0); _, y0 = self._xy(0, 0); _, y1 = self._xy(0, self.W_MAX)
+            p.drawLine(x, y1, x, y0)
+        for wg in range(0, 32, 5):
+            _, y = self._xy(0, wg/1000); x0, _ = self._xy(0, 0); x1, _ = self._xy(50, 0)
+            p.drawLine(x0, y, x1, y)
+
+        # RH isolines — closer colour steps, dashed
+        rh_levels = [(10,"#0A1220"),(20,"#0C1628"),(30,"#0D1A30"),(40,"#0F1E38"),
+                     (50,"#111F3C"),(60,"#122240"),(70,"#142545"),(80,"#162848"),(100,"#0070AA")]
+        for rh_pct, clr in rh_levels:
+            pts = []
+            for Ti in range(0, 52, 1):
+                ww = Psych.omega(float(Ti), float(rh_pct))
+                if ww > self.W_MAX + 0.001: break
+                pts.append(QPointF(*self._xy(float(Ti), min(ww, self.W_MAX))))
+            if len(pts) < 2: continue
+            is_sat = (rh_pct == 100)
+            pen = QPen(QColor(clr), 1.6 if is_sat else 0.8)
+            if not is_sat: pen.setStyle(Qt.PenStyle.DashLine)
+            p.setPen(pen)
+            for i in range(len(pts)-1): p.drawLine(pts[i], pts[i+1])
+            if pts and not is_sat:
+                lp = pts[-1]; p.setPen(QPen(QColor("#4080B0")))
+                p.setFont(QFont("Consolas", 8))
+                p.drawText(int(lp.x())-22, int(lp.y())-1, f"{rh_pct}%")
+
+        # Target zone — proper curved psychrometric shape
+        T_lo = self._T_sp - self._T_tol; T_hi = self._T_sp + self._T_tol
+        RH_lo = max(1.0, self._RH_sp - self._RH_tol)
+        RH_hi = min(99.0, self._RH_sp + self._RH_tol)
+        N = 20; T_steps = [T_lo + i*(T_hi-T_lo)/(N-1) for i in range(N)]
+        bot = [QPointF(*self._xy(T, Psych.omega(T, RH_lo))) for T in T_steps]
+        top = [QPointF(*self._xy(T, Psych.omega(T, RH_hi))) for T in reversed(T_steps)]
+        zone = QPainterPath(); zone.moveTo(bot[0])
+        for pt in bot[1:]: zone.lineTo(pt)
+        for pt in top: zone.lineTo(pt)
+        zone.closeSubpath()
+        p.fillPath(zone, QColor(0, 180, 255, 22))
+        p.setPen(QPen(QColor("#0088FF"), 1.3, Qt.PenStyle.DashLine)); p.drawPath(zone)
+
+        # Company watermark — auto-sized to span chart width
+        wm = "亞聖國際科技有限公司"
+        lm = 60; rm = 10
+        avail_w = W - lm - rm
+        for fs in range(48, 10, -2):
+            p.setFont(QFont("Microsoft JhengHei", fs, QFont.Weight.Bold))
+            if p.fontMetrics().horizontalAdvance(wm) <= avail_w:
+                break
+        fm_wm = p.fontMetrics()
+        p.setPen(QPen(QColor(0, 180, 220, 42)))
+        wm_x = lm + (avail_w - fm_wm.horizontalAdvance(wm)) // 2
+        _, cy_w = self._xy(25.0, 0.013)
+        p.drawText(wm_x, cy_w + 5, wm)
+
+        # Process path — each segment interpolated & clamped below saturation curve
+        pts_path = []
+        for s in self._states:
+            Tc = max(self.T_MIN, min(self.T_MAX, s.T))
+            wc = max(self.W_MIN, min(self.W_MAX, s.w))
+            pts_path.append(self._xy(Tc, wc))
+
+        # Build per-segment traced sub-paths (16 sub-points, w clamped to ω_sat)
+        N_SUB = 16
+        segs = []
+        for i in range(len(self._states) - 1):
+            sa = self._states[i]; sb = self._states[i+1]
+            seg = []
+            for k in range(N_SUB + 1):
+                t = k / N_SUB
+                T = sa.T + t*(sb.T - sa.T)
+                w = sa.w + t*(sb.w - sa.w)
+                w = min(w, Psych.omega_sat(T))          # never above saturation
+                Tc2 = max(self.T_MIN, min(self.T_MAX, T))
+                wc2 = max(self.W_MIN, min(self.W_MAX, w))
+                seg.append(self._xy(Tc2, wc2))
+            segs.append(seg)
+
+        # Glow pass
+        p.setPen(QPen(QColor(0, 180, 230, 50), 7))
+        for seg in segs:
+            for j in range(len(seg)-1): p.drawLine(*seg[j], *seg[j+1])
+        # Main line
+        p.setPen(QPen(QColor("#00CCEE"), 2.2))
+        for seg in segs:
+            for j in range(len(seg)-1): p.drawLine(*seg[j], *seg[j+1])
+        # Arrowhead at midpoint of each segment
+        p.setBrush(QColor("#00CCEE")); p.setPen(Qt.PenStyle.NoPen)
+        for seg in segs:
+            mid = len(seg)//2
+            x1, y1 = seg[mid-1]; x2, y2 = seg[mid]
+            mx, my = (x1+x2)//2, (y1+y2)//2
+            ang = math.atan2(y2-y1, x2-x1); sz = 6
+            p.drawPolygon(QPolygonF([
+                QPointF(mx + sz*math.cos(ang),     my + sz*math.sin(ang)),
+                QPointF(mx + sz*math.cos(ang+2.4), my + sz*math.sin(ang+2.4)),
+                QPointF(mx + sz*math.cos(ang-2.4), my + sz*math.sin(ang-2.4)),
+            ]))
+
+        # Segment process labels (Chinese + English, offset perpendicular to path)
+        seg_labels = [
+            "① 預熱 Preheat",
+            "② 預冷 PreCool",
+            "③ 等焓加濕 Adiabatic",
+            "④ 冷卻除濕 Dehumid",
+            "⑤ 再熱 Reheat",
+            "⑥ 供氣 Supply",
+        ]
+        seg_offsets = [(0, -14), (0, -14), (12, 6), (0, 14), (0, -14), (12, -14)]
+        p.setFont(QFont("Microsoft JhengHei", 7))
+        for i, (seg, lbl, (ox, oy)) in enumerate(zip(segs, seg_labels, seg_offsets)):
+            if len(seg) < 2: continue
+            mx = (seg[0][0] + seg[-1][0]) // 2 + ox
+            my = (seg[0][1] + seg[-1][1]) // 2 + oy
+            clr = QColor(_SACCNT[i]) if i < len(_SACCNT) else QColor("#AAAAAA")
+            p.setPen(QPen(QColor(0, 0, 0, 120)))
+            p.drawText(mx+1, my+1, lbl)
+            p.setPen(QPen(clr))
+            p.drawText(mx, my, lbl)
+
+        # State points
+        acc_clrs = ["#3D8EFF","#FF6B35","#00D4FF","#00FF9F","#2E86FF","#FFB300","#BB77FF"]
+        lbls = ["OA","①","②","W","③","④","SA"]
+        for i, (px, py) in enumerate(pts_path):
+            sel_pt = (i - 1 == self._sel) if self._sel >= 0 else False
+            clr = QColor(acc_clrs[i])
+            r = 9 if sel_pt else 5
+            if sel_pt:
+                p.setPen(Qt.PenStyle.NoPen); p.setBrush(QColor(255,255,255,50))
+                p.drawEllipse(px-r-4, py-r-4, 2*(r+4), 2*(r+4))
+            p.setPen(Qt.PenStyle.NoPen); p.setBrush(clr)
+            p.drawEllipse(px-r, py-r, 2*r, 2*r)
+            if sel_pt:
+                p.setPen(QPen(QColor("#FFFFFF"), 1.5)); p.setBrush(Qt.BrushStyle.NoBrush)
+                p.drawEllipse(px-r, py-r, 2*r, 2*r)
+            p.setPen(QPen(QColor("#FFFFFF") if sel_pt else QColor("#CCCCCC")))
+            p.setFont(QFont("Consolas", 8, QFont.Weight.Bold))
+            p.drawText(px+r+2, py-r, lbls[i])
+
+        # Axes
+        x0a, y_ax = self._xy(0, 0); x1a, _ = self._xy(50, 0); _, y_top = self._xy(0, self.W_MAX)
+        p.setPen(QPen(QColor("#1E3A60"), 1)); p.drawLine(x0a, y_ax, x1a, y_ax); p.drawLine(x0a, y_ax, x0a, y_top)
+        p.setFont(QFont("Consolas", 8)); p.setPen(QPen(QColor("#6090CC")))
+        for T in range(0, 55, 10):
+            x, _ = self._xy(T, 0); p.drawText(x-10, y_ax+14, f"{T}")
+        for wg in range(0, 32, 5):
+            _, y = self._xy(0, wg/1000); p.drawText(2, y+4, f"{wg}")
+        p.setFont(QFont("Microsoft JhengHei", 8)); p.setPen(QPen(QColor("#6090CC")))
+        p.drawText(W//2-24, H-4, "乾球溫度 (°C)")
+        p.save(); p.translate(12, H//2+30); p.rotate(-90); p.drawText(0, 0, "ω (g/kg)"); p.restore()
+        p.end()
+
+
+# ═══════════════════════════════════════════════════════
+#  STAGE FACEPLATE
+# ═══════════════════════════════════════════════════════
+class _StageFaceplate(QFrame):
+    _BG  = "#060E1E"; _CELL = "#0A1630"; _BDR = "#162845"
+    _ACC = "#00B4D8"; _PVC = "#00D4FF"; _SPC = "#00FF9F"; _MVC = "#FF7700"
+    TH = 80
+
+    def __init__(self, name: str, pid: PidCtrl, fopdt: FopdtCoil,
+                 pv_lo: float, pv_hi: float, select_cb=None, pv_modes=None):
+        super().__init__()
+        self._name = name; self._pid = pid; self._fopdt = fopdt
+        # pv_modes: list of (label, lo, hi, default_sp)
+        self._pv_modes = pv_modes or []
+        self._pv_mode_idx = 0
+        if self._pv_modes:
+            _, pv_lo, pv_hi, sp0 = self._pv_modes[0]
+            self._sp = sp0
+        else:
+            self._sp = (pv_lo + pv_hi) / 2.0
+        self._pv_lo = pv_lo; self._pv_hi = pv_hi
+        self._select_cb = select_cb; self._selected = False
+        self.setMinimumWidth(210); self.setMaximumWidth(280); self.setMinimumHeight(360)
+        self._update_border(); self._build()
+
+    def _update_border(self):
+        clr = "#00FFCC" if self._selected else self._ACC
+        w = "2px" if self._selected else "1px"
+        self.setStyleSheet(f"QFrame{{background:{self._BG};border:{w} solid {clr};"
+                           f"border-radius:6px;}}")
+
+    def set_selected(self, sel: bool):
+        self._selected = sel; self._update_border()
+
+    def mousePressEvent(self, e):
+        if self._select_cb: self._select_cb()
+        super().mousePressEvent(e)
+
+    def _build(self):
+        lay = QVBoxLayout(self); lay.setContentsMargins(7, 7, 7, 7); lay.setSpacing(4)
+
+        # Header
+        hdr = QHBoxLayout(); hdr.setSpacing(4)
+        nl = QLabel(self._name.replace("\n", "  "))
+        nl.setStyleSheet(f"color:{self._ACC};font-size:10pt;font-weight:700;"
+                         f"background:transparent;border:none;"
+                         f"font-family:'Microsoft JhengHei','Segoe UI';")
+        self._mode_btn = QPushButton("AUTO")
+        self._mode_btn.setFixedSize(52, 24); self._mode_btn.setCheckable(True); self._mode_btn.setChecked(True)
+        self._mode_btn.clicked.connect(self._toggle_mode); self._mode_btn.setStyleSheet(self._mode_qss(True))
+        hdr.addWidget(nl, 1); hdr.addWidget(self._mode_btn); lay.addLayout(hdr)
+
+        # PV mode selector (only when multiple modes provided, e.g. HTC-1)
+        self._pv_mode_btns = []
+        if len(self._pv_modes) > 1:
+            sel_row = QHBoxLayout(); sel_row.setSpacing(3); sel_row.setContentsMargins(0,0,0,0)
+            for idx, (lbl, *_) in enumerate(self._pv_modes):
+                btn = QPushButton(lbl); btn.setFixedHeight(22)
+                i = idx
+                btn.clicked.connect(lambda _, i=i: self._set_pv_mode(i))
+                self._pv_mode_btns.append(btn); sel_row.addWidget(btn, 1)
+            lay.addLayout(sel_row)
+            self._refresh_pv_mode_btns()
+
+        # Bars
+        bar_wrap = QFrame()
+        bar_wrap.setFixedHeight(self.TH + 48)
+        bar_wrap.setStyleSheet(f"QFrame{{background:{self._CELL};border:none;border-radius:4px;}}")
+        bl = QHBoxLayout(bar_wrap); bl.setContentsMargins(14, 6, 14, 5); bl.setSpacing(20)
+        bl.setAlignment(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignBottom)
+        self._pv_fill = self._sp_fill = self._mv_fill = None
+        self._pv_num = QLabel("—"); self._sp_num = QLabel("—"); self._mv_num = QLabel("—")
+        for attr, clr, txt, num in (("_pv_fill",self._PVC,"PV",self._pv_num),
+                                     ("_sp_fill",self._SPC,"SP",self._sp_num),
+                                     ("_mv_fill",self._MVC,"MV",self._mv_num)):
+            col = QVBoxLayout(); col.setSpacing(3)
+            col.setAlignment(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignBottom)
+            cap = QLabel(txt); cap.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            cap.setStyleSheet(f"color:{clr};font-size:8pt;font-weight:700;"
+                              f"background:transparent;border:none;font-family:Consolas;")
+            col.addWidget(cap)
+            track = QFrame(); track.setFixedSize(22, self.TH)
+            track.setStyleSheet("QFrame{background:#060F22;border:1px solid #1A3060;border-radius:3px;}")
+            fill = QFrame(track)
+            fill.setStyleSheet(f"QFrame{{background:{clr};border-radius:2px;border:none;}}")
+            fill.setGeometry(2, self.TH-2, 18, 2); setattr(self, attr, fill)
+            num.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            num.setStyleSheet(f"color:{clr};font-size:9pt;font-weight:700;"
+                              f"background:transparent;border:none;font-family:Consolas;")
+            col.addWidget(track); col.addWidget(num); bl.addLayout(col)
+        lay.addWidget(bar_wrap)
+
+        # SP row
+        spr = QHBoxLayout(); spr.setSpacing(4)
+        spr.addWidget(self._lbl("SP:")); self._sp_in = self._inp(f"{self._sp:.1f}", self._SPC)
+        self._sp_in.editingFinished.connect(self._commit_sp); spr.addWidget(self._sp_in, 1)
+        lay.addLayout(spr)
+
+        # Manual MV row (hidden in AUTO)
+        mvr = QHBoxLayout(); mvr.setSpacing(4)
+        mvr.addWidget(self._lbl("MV:")); self._mv_in = self._inp(f"{self._pid.manual_mv:.1f}", self._MVC)
+        self._mv_in.editingFinished.connect(self._commit_mv); mvr.addWidget(self._mv_in, 1)
+        self._mv_widget = QWidget(); self._mv_widget.setLayout(mvr)
+        self._mv_widget.setStyleSheet("QWidget{background:transparent;border:none;}")
+        self._mv_widget.setVisible(False); lay.addWidget(self._mv_widget)
+
+        # PV range
+        lay.addWidget(self._sec("PV RANGE  Lo / Hi"))
+        pvr = QHBoxLayout(); pvr.setSpacing(3)
+        self._pvlo_in = self._inp(f"{self._pv_lo:.1f}", "#66CCEE")
+        self._pvhi_in = self._inp(f"{self._pv_hi:.1f}", "#66CCEE")
+        for e in (self._pvlo_in, self._pvhi_in):
+            e.editingFinished.connect(self._commit_pv_range); pvr.addWidget(e, 1)
+        lay.addLayout(pvr)
+
+        # PID
+        lay.addWidget(self._sec("PID  Kp / Ki / Kd"))
+        pidr = QHBoxLayout(); pidr.setSpacing(3)
+        self._kp_in = self._inp(f"{self._pid.Kp:.3g}", "#FFCC44")
+        self._ki_in = self._inp(f"{self._pid.Ki:.3g}", "#FFCC44")
+        self._kd_in = self._inp(f"{self._pid.Kd:.3g}", "#FFCC44")
+        for e in (self._kp_in, self._ki_in, self._kd_in):
+            e.editingFinished.connect(self._commit_pid); pidr.addWidget(e, 1)
+        lay.addLayout(pidr)
+
+        # FOPDT (always shown)
+        lay.addWidget(self._sec("FOPDT  Gain / τ(s) / L(s)"))
+        fo_row = QHBoxLayout(); fo_row.setSpacing(3)
+        self._fkp = self._inp(f"{self._fopdt.Kp:.3g}", "#77BBFF")
+        self._fta = self._inp(f"{self._fopdt.tau:.1f}", "#77BBFF")
+        self._fL  = self._inp(f"{self._fopdt.L:.1f}", "#77BBFF")
+        for e in (self._fkp, self._fta, self._fL):
+            e.editingFinished.connect(self._commit_fopdt); fo_row.addWidget(e, 1)
+        lay.addLayout(fo_row)
+        lay.addStretch()
+
+    def _lbl(self, t):
+        l = QLabel(t); l.setStyleSheet("color:#B0C8D8;font-size:9pt;font-weight:600;background:transparent;"
+                                        "border:none;font-family:'Segoe UI';"); return l
+
+    def _sec(self, t):
+        l = QLabel(t); l.setFixedHeight(18)
+        l.setStyleSheet(f"color:#55AADD;font-size:8pt;font-weight:700;"
+                        f"background:{self._CELL};border:none;padding-left:3px;"
+                        f"font-family:Consolas;letter-spacing:0.8px;"); return l
+
+    def _set_pv_mode(self, idx: int):
+        self._pv_mode_idx = idx
+        _, lo, hi, sp0 = self._pv_modes[idx]
+        self._pv_lo = lo; self._pv_hi = hi; self._sp = sp0
+        self._pvlo_in.setText(f"{lo:.1f}"); self._pvhi_in.setText(f"{hi:.1f}")
+        self._sp_in.setText(f"{sp0:.1f}")
+        self._pid.reset()
+        self._refresh_pv_mode_btns()
+
+    def _refresh_pv_mode_btns(self):
+        _on  = ("QPushButton{background:#003A55;color:#00D4FF;border:1px solid #006688;"
+                "border-radius:3px;font-size:7pt;font-weight:700;font-family:Consolas;}")
+        _off = ("QPushButton{background:#0A0F18;color:#3A5570;border:1px solid #182030;"
+                "border-radius:3px;font-size:7pt;font-weight:700;font-family:Consolas;}")
+        for i, btn in enumerate(self._pv_mode_btns):
+            btn.setStyleSheet(_on if i == self._pv_mode_idx else _off)
+
+    @property
+    def pv_mode_idx(self): return self._pv_mode_idx
+
+    def _inp(self, txt, clr):
+        e = QLineEdit(txt); e.setFixedHeight(26); e.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        e.setStyleSheet(f"QLineEdit{{background:#050C1C;color:{clr};"
+                        f"border:1px solid {self._BDR};border-radius:3px;"
+                        f"font-size:10pt;font-weight:700;font-family:Consolas;}}"
+                        f"QLineEdit:focus{{border:1px solid {self._ACC};}}"); return e
+
+    def _mode_qss(self, auto):
+        if auto:
+            return ("QPushButton{background:#003A55;color:#00D4FF;border:1px solid #006688;"
+                    "border-radius:3px;font-size:9pt;font-weight:700;font-family:Consolas;}"
+                    "QPushButton:hover{background:#004A6A;}")
+        return ("QPushButton{background:#3A2200;color:#FFB300;border:1px solid #775500;"
+                "border-radius:3px;font-size:9pt;font-weight:700;font-family:Consolas;}"
+                "QPushButton:hover{background:#4A2C00;}")
+
+    def _toggle_mode(self, checked):
+        self._pid.auto = checked
+        self._mode_btn.setText("AUTO" if checked else "MAN")
+        self._mode_btn.setStyleSheet(self._mode_qss(checked))
+        self._mv_widget.setVisible(not checked)
+
+    def _commit_sp(self):
+        try: v = float(self._sp_in.text())
+        except: v = self._sp
+        self._sp = max(self._pv_lo, min(self._pv_hi, v)); self._sp_in.setText(f"{self._sp:.1f}")
+
+    def _commit_mv(self):
+        try: v = float(self._mv_in.text())
+        except: return
+        self._pid.manual_mv = max(self._pid.mv_lo, min(self._pid.mv_hi, v))
+        self._mv_in.setText(f"{self._pid.manual_mv:.1f}")
+
+    def _commit_pv_range(self):
+        try: lo = float(self._pvlo_in.text()); self._pv_lo = lo
+        except: pass
+        try: hi = float(self._pvhi_in.text()); self._pv_hi = max(self._pv_lo+1, hi)
+        except: pass
+
+    def _commit_pid(self):
+        try: self._pid.Kp = max(0.0, float(self._kp_in.text()))
+        except: pass
+        try: self._pid.Ki = max(0.0, float(self._ki_in.text()))
+        except: pass
+        try: self._pid.Kd = max(0.0, float(self._kd_in.text()))
+        except: pass
+
+    def _commit_fopdt(self):
+        try: self._fopdt.Kp  = max(0.001, float(self._fkp.text()))
+        except: pass
+        try: self._fopdt.tau = max(0.5,   float(self._fta.text()))
+        except: pass
+        try: self._fopdt.L   = max(0.0,   float(self._fL.text()))
+        except: pass
+
+    def update_display(self, pv: float, mv: float):
+        span = max(1e-6, self._pv_hi - self._pv_lo)
+        TH = self.TH
+        def sb(fill, ratio):
+            bh = max(2, int(max(0.0,min(1.0,ratio))*TH)); fill.setGeometry(2, TH-bh, 18, bh)
+        sb(self._pv_fill, (pv-self._pv_lo)/span)
+        sb(self._sp_fill, (self._sp-self._pv_lo)/span)
+        sb(self._mv_fill, mv/100.0)
+        self._pv_num.setText(f"{pv:.1f}"); self._sp_num.setText(f"{self._sp:.1f}")
+        self._mv_num.setText(f"{mv:.0f}%")
+        if not self._pid.auto and not self._mv_in.hasFocus():
+            self._mv_in.setText(f"{self._pid.manual_mv:.1f}")
+
+    @property
+    def sp(self): return self._sp
+
+
+# ═══════════════════════════════════════════════════════
+#  CONNECTION-LINE OVERLAY
+# ═══════════════════════════════════════════════════════
+class _ConnectionOverlay(QWidget):
+    """Transparent overlay that draws dim wires from stage boxes → faceplates.
+    When a stage is selected the corresponding wire lights up with glow."""
+
+    def __init__(self, content_widget):
+        super().__init__(content_widget)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground)
+        self.setStyleSheet("background:transparent;")
+        self._schematic: _MauSchematic | None = None
+        self._fps: list = []
+        self._sel = -1          # faceplate index (0-5), -1 = none
+
+    def setup(self, schematic, faceplates):
+        self._schematic = schematic
+        self._fps = list(faceplates)
+
+    def set_sel(self, fp_idx: int):
+        if self._sel != fp_idx:
+            self._sel = fp_idx; self.update()
+
+    def paintEvent(self, _):
+        return  # overlay lines removed per user request
+        if not self._schematic or not self._fps:
+            return
+        content = self.parent()
+        try:
+            isa_pts = self._schematic.isa_instrument_positions()
+        except Exception:
+            return
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+        for fi, fp in enumerate(self._fps):
+            if fi >= len(isa_pts):
+                continue
+            acc = QColor(_SACCNT[fi + 1])
+            sel = (fi == self._sel)
+
+            ix, iy = isa_pts[fi]
+            # Map ISA circle center and faceplate top-center into overlay coords
+            # (overlay is parented to content and covers content.rect() exactly)
+            src = self._schematic.mapTo(content, QPoint(ix, iy))
+            dst = fp.mapTo(content, QPoint(fp.width() // 2, 0))
+
+            # L-shaped routing: vertical ↓ from ISA → horizontal → vertical ↓ to faceplate
+            bus_y = dst.y() - 14
+            p1 = QPoint(src.x(), bus_y)
+            p2 = QPoint(dst.x(), bus_y)
+
+            if sel:
+                gpen = QPen(QColor(acc.red(), acc.green(), acc.blue(), 55), 10)
+                gpen.setCapStyle(Qt.PenCapStyle.RoundCap)
+                gpen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+                p.setPen(gpen)
+                p.drawLine(src, p1); p.drawLine(p1, p2); p.drawLine(p2, dst)
+                cp = QPen(acc, 2, Qt.PenStyle.SolidLine,
+                          Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin)
+                p.setPen(cp)
+                p.drawLine(src, p1); p.drawLine(p1, p2); p.drawLine(p2, dst)
+                p.setPen(Qt.PenStyle.NoPen); p.setBrush(acc)
+                p.drawEllipse(src, 4, 4); p.drawEllipse(dst, 4, 4)
+            else:
+                pen = QPen(QColor(acc.red(), acc.green(), acc.blue(), 38), 1)
+                pen.setStyle(Qt.PenStyle.DashLine)
+                pen.setDashPattern([5.0, 7.0])
+                p.setPen(pen); p.setBrush(Qt.BrushStyle.NoBrush)
+                p.drawLine(src, p1); p.drawLine(p1, p2); p.drawLine(p2, dst)
+
+        p.end()
+
+
+# ═══════════════════════════════════════════════════════
+#  MAIN WINDOW
+# ═══════════════════════════════════════════════════════
+class MauSimulator(BaseToolWindow):
+    _BG = "#050B18"; _CELL = "#0A1428"; _BDR = "#162440"; _ACC = "#00B4D8"
+    _DT = 0.05
+
+    def __init__(self):
+        super().__init__("🌬️ MAU PRO-SIM 7X   Industrial Psychrometrics Engine", 1400, 900)
+        self.setMinimumSize(900, 600); self.content.setStyleSheet(f"background:{self._BG};")
+        self._climate = "Winter"; self._speed = 1; self._sel = -1
+        self._states = [AirState(6.0, Psych.omega(6.0, 50.0))] * 7
+        self._fan_hz = 45.0; self._p_static = 2000.0
+
+        self._pid = [
+            PidCtrl(2.5, 0.08, 0.0, reverse=True),    # 0 HTC1
+            PidCtrl(1.8, 0.05, 0.0, reverse=False),    # 1 CC1
+            PidCtrl(2.0, 0.10, 0.0, reverse=True),     # 2 Washer (on RH)
+            PidCtrl(3.0, 0.15, 0.0, reverse=False),    # 3 CC2
+            PidCtrl(2.0, 0.10, 0.0, reverse=True),     # 4 HTC2
+            PidCtrl(0.05, 0.03, 0.0, reverse=True),    # 5 Fan
+        ]
+        self._fo = [
+            FopdtCoil(0.3,  55.0, 5.0, heating=True),    # HTC1
+            FopdtCoil(0.3,  65.0, 6.0, heating=False),   # CC1
+            FopdtCoil(3.0,  30.0, 3.0, heating=True),    # Washer (effectiveness lag)
+            FopdtCoil(0.3,  35.0, 4.0, heating=False),   # CC2
+            FopdtCoil(0.3,  45.0, 5.0, heating=True),    # HTC2
+            FopdtCoil(40.0, 10.0, 1.0, heating=True),    # Fan (Pa response)
+        ]
+
+        root = QVBoxLayout(self.content); root.setContentsMargins(4,4,4,4); root.setSpacing(4)
+        root.addWidget(self._build_toolbar())
+
+        # Paged body: page 0 = live sim, page 1 = formula sheet
+        self._fv = {}           # live-value labels for formula page
+        self._pages = QStackedWidget()
+        self._pages.setStyleSheet(f"background:{self._BG};")
+
+        p0 = QWidget(); p0.setStyleSheet(f"background:{self._BG};")
+        mid = QHBoxLayout(p0); mid.setContentsMargins(0,0,0,0); mid.setSpacing(6)
+        mid.addWidget(self._build_left(), 5); mid.addWidget(self._build_right(), 5)
+        self._pages.addWidget(p0)
+        self._pages.addWidget(self._build_formula_page())   # page 1
+
+        body_row = QHBoxLayout(); body_row.setContentsMargins(0,0,0,0); body_row.setSpacing(0)
+        body_row.addWidget(self._pages, 1)
+        body_row.addWidget(self._build_nav_panel())
+        root.addLayout(body_row, 3)
+        root.addWidget(self._build_faceplates(), 2)
+
+        # Connection-line overlay (covers full content, sits on top)
+        self._overlay = _ConnectionOverlay(self.content)
+        self._overlay.setup(self._schematic, self._fp)
+        self._overlay.setGeometry(self.content.rect())
+        self._overlay.raise_()
+
+        self._timer = QTimer(self); self._timer.timeout.connect(self._tick)
+        self._reset()
+
+    # ── layout ──────────────────────────────────────────
+    def _build_toolbar(self):
+        f = QFrame(); f.setFixedHeight(118)
+        f.setStyleSheet("QFrame{background:#06091A;border-bottom:1px solid #162440;border-radius:0px;}")
+        h = QHBoxLayout(f); h.setContentsMargins(18, 10, 18, 10); h.setSpacing(18)
+
+        # ── CLIMATE PROFILE ──────────────────────────────
+        cp_v = QVBoxLayout(); cp_v.setSpacing(8); cp_v.setContentsMargins(0,0,0,0)
+        cap_cp = QLabel("CLIMATE PROFILE")
+        cap_cp.setStyleSheet("color:#4A6A8A;font-size:8pt;font-weight:700;background:transparent;"
+                             "border:none;font-family:Consolas;letter-spacing:2px;")
+        cp_v.addWidget(cap_cp)
+        br = QHBoxLayout(); br.setSpacing(8); br.setContentsMargins(0,0,0,0)
+        self._btn_summer = QPushButton("SUMMER"); self._btn_summer.setFixedHeight(36)
+        self._btn_winter = QPushButton("WINTER"); self._btn_winter.setFixedHeight(36)
+        self._btn_summer.clicked.connect(lambda: self._set_climate("Summer"))
+        self._btn_winter.clicked.connect(lambda: self._set_climate("Winter"))
+        br.addWidget(self._btn_summer); br.addWidget(self._btn_winter)
+        cp_v.addLayout(br); h.addLayout(cp_v)
+        self._update_clim_btns()
+
+        # ── Divider ──────────────────────────────────────
+        h.addWidget(self._vsep())
+
+        # ── OA TEMP + OA RH ──────────────────────────────
+        oa_v = QVBoxLayout(); oa_v.setSpacing(6); oa_v.setContentsMargins(0,0,0,0)
+        oa_row = QHBoxLayout(); oa_row.setSpacing(28); oa_row.setContentsMargins(0,0,0,0)
+        def _oa_col(cap_txt, cap_clr):
+            c = QVBoxLayout(); c.setSpacing(2); c.setContentsMargins(0,0,0,0)
+            cap = QLabel(cap_txt)
+            cap.setStyleSheet(f"color:#4A6A8A;font-size:8pt;font-weight:700;background:transparent;"
+                              f"border:none;font-family:Consolas;letter-spacing:1px;")
+            lbl = QLabel("—")
+            lbl.setStyleSheet(f"color:{cap_clr};font-size:22pt;font-weight:700;background:transparent;"
+                              f"border:none;font-family:'Segoe UI',Consolas;")
+            c.addWidget(cap); c.addWidget(lbl); return c, lbl
+        T_col, self._oa_T_lbl = _oa_col("OA TEMP", "#E0ECF8")
+        RH_col, self._oa_RH_lbl = _oa_col("OA RH",  "#E0ECF8")
+        oa_row.addLayout(T_col); oa_row.addLayout(RH_col)
+        oa_v.addLayout(oa_row); h.addLayout(oa_v)
+
+        # ── Speed + Reset (compact) ───────────────────────
+        h.addWidget(self._vsep())
+        ctrl_v = QVBoxLayout(); ctrl_v.setSpacing(4); ctrl_v.setContentsMargins(0,0,0,0)
+        spd = QComboBox()
+        for v in ("1×","2×","5×","10×"): spd.addItem(v)
+        spd.setFixedSize(62, 28)
+        spd.setStyleSheet(f"QComboBox{{background:#0A1428;color:#CCC;border:1px solid #1A2A40;"
+                          f"border-radius:3px;font-size:9pt;font-weight:700;padding:1px 4px;"
+                          f"font-family:Consolas;}}QComboBox::drop-down{{border:none;width:10px;}}"
+                          f"QComboBox QAbstractItemView{{background:#0A1428;color:#CCC;"
+                          f"border:1px solid #1A2A40;}}")
+        spd.currentIndexChanged.connect(lambda i: setattr(self, "_speed", [1,2,5,10][i]))
+        rst = QPushButton("⟳ RESET"); rst.setFixedSize(82, 28)
+        rst.setStyleSheet("QPushButton{background:#181800;color:#AAAA00;border:1px solid #333300;"
+                          "border-radius:3px;font-size:9pt;font-weight:700;font-family:Consolas;}"
+                          "QPushButton:hover{background:#222200;color:#FFFF00;}")
+        rst.clicked.connect(self._reset)
+        ctrl_v.addWidget(spd); ctrl_v.addWidget(rst); h.addLayout(ctrl_v)
+
+        h.addStretch()
+
+        # ── FINAL SUPPLY AIR card ─────────────────────────
+        sa_card = QFrame()
+        sa_card.setStyleSheet("QFrame{background:#09122A;border:1px solid #1E3060;border-radius:8px;}")
+        sa_l = QVBoxLayout(sa_card); sa_l.setContentsMargins(20, 8, 20, 8); sa_l.setSpacing(6)
+        sa_cap = QLabel("FINAL SUPPLY AIR"); sa_cap.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        sa_cap.setStyleSheet("color:#00B4D8;font-size:9pt;font-weight:700;background:transparent;"
+                             "border:none;font-family:Consolas;letter-spacing:2px;")
+        sa_l.addWidget(sa_cap)
+        sa_row = QHBoxLayout(); sa_row.setSpacing(26); sa_row.setContentsMargins(0,0,0,0)
+        def _sa_col(sub_lbl, val_clr):
+            c = QVBoxLayout(); c.setSpacing(2); c.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            c.setContentsMargins(0,0,0,0)
+            sc = QLabel(sub_lbl); sc.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            sc.setStyleSheet("color:#4A6A8A;font-size:8pt;font-weight:700;background:transparent;"
+                             "border:none;font-family:Consolas;")
+            vl = QLabel("—"); vl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            vl.setStyleSheet(f"color:{val_clr};font-size:22pt;font-weight:700;background:transparent;"
+                             f"border:none;font-family:'Segoe UI',Consolas;")
+            c.addWidget(sc); c.addWidget(vl); return c, vl
+        Tc, self._final_T_lbl = _sa_col("TEMP", "#00D4FF")
+        Rc, self._final_lbl   = _sa_col("RH",   "#00FF9F")
+        sa_row.addLayout(Tc); sa_row.addLayout(Rc)
+        sa_l.addLayout(sa_row); h.addWidget(sa_card)
+
+        h.addStretch()
+
+        # ── Title ─────────────────────────────────────────
+        title_v = QVBoxLayout(); title_v.setSpacing(4); title_v.setContentsMargins(0,0,0,0)
+        title_v.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        t1 = QLabel("MAU UNIT SCHEMATIC"); t1.setAlignment(Qt.AlignmentFlag.AlignRight)
+        t1.setStyleSheet("color:#E0ECF8;font-size:18pt;font-weight:700;background:transparent;"
+                         "border:none;font-family:'Segoe UI',Consolas;letter-spacing:1px;")
+        t2 = QLabel("PROCESS VISUALIZATION"); t2.setAlignment(Qt.AlignmentFlag.AlignRight)
+        t2.setStyleSheet("color:#3A5A7A;font-size:9pt;font-weight:600;background:transparent;"
+                         "border:none;font-family:Consolas;letter-spacing:2px;")
+        title_v.addWidget(t1); title_v.addWidget(t2); h.addLayout(title_v)
+        return f
+
+    def _build_left(self):
+        f = QFrame(); f.setStyleSheet(f"QFrame{{background:{self._BG};border:none;}}")
+        lay = QVBoxLayout(f); lay.setContentsMargins(0,0,0,0); lay.setSpacing(4)
+        self._schematic = _MauSchematic(select_cb=self._on_schematic_click)
+        self._schematic.setMinimumHeight(220); lay.addWidget(self._schematic, 1)
+        return f
+
+    def _build_strip(self):
+        f = QFrame(); f.setFixedHeight(88)
+        f.setStyleSheet(f"QFrame{{background:{self._CELL};border:1px solid {self._BDR};border-radius:3px;}}")
+        h = QHBoxLayout(f); h.setContentsMargins(6,3,6,3); h.setSpacing(0)
+        hdrs = ["OA INLET","HTC-1","CC-1","WASHER","CC-2","HTC-2","SUPPLY FAN"]
+        self._strip = []
+        for i, hdr in enumerate(hdrs):
+            col = QVBoxLayout(); col.setSpacing(1); col.setContentsMargins(2,0,2,0)
+            hl = QLabel(hdr); hl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            hl.setStyleSheet(f"color:{_SACCNT[i]};font-size:8.5pt;font-weight:700;"
+                             f"background:transparent;border:none;font-family:'Microsoft JhengHei',Consolas;")
+            col.addWidget(hl); row = []
+            for _ in range(3):
+                l = QLabel("—"); l.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                l.setStyleSheet("color:#D8E4EE;font-size:8pt;font-weight:600;"
+                                "background:transparent;border:none;font-family:Consolas;")
+                col.addWidget(l); row.append(l)
+            self._strip.append(row); h.addLayout(col, 1)
+            if i < len(hdrs)-1:
+                d = QFrame(); d.setFrameShape(QFrame.Shape.VLine)
+                d.setStyleSheet(f"QFrame{{border:none;border-left:1px solid {self._BDR};background:transparent;}}"); h.addWidget(d)
+        return f
+
+    def _build_faceplates(self):
+        f = QFrame(); f.setStyleSheet(f"QFrame{{background:{self._BG};border:none;}}")
+        h = QHBoxLayout(f); h.setContentsMargins(3, 3, 3, 3); h.setSpacing(5)
+
+        defs = [
+            ("HTC-1\nPREHEAT",   self._pid[0], self._fo[0],  0.0,    45.0),
+            ("CC-1\nPRECOOL",    self._pid[1], self._fo[1],  0.0,    40.0),
+            ("WASHER\nHUMIDIFY", self._pid[2], self._fo[2],  50.0,  100.0),
+            ("CC-2\nDEHUMID",    self._pid[3], self._fo[3],  7.0,    30.0),
+            ("HTC-2\nREHEAT",    self._pid[4], self._fo[4],  7.0,    40.0),
+            ("SUPPLY\nFAN",      self._pid[5], self._fo[5],  500.0, 4000.0),
+        ]
+        default_sps = [22.0, 24.0, 90.0, 10.0, 22.0, 2000.0]
+        self._fp: list[_StageFaceplate] = []
+        for idx, ((name, pid, fo, lo, hi), sp) in enumerate(zip(defs, default_sps)):
+            i = idx
+            htc1_modes = [("T °C", 0.0, 45.0, 22.0), ("H kJ/kg", 0.0, 100.0, 40.0)] if idx == 0 else None
+            fp = _StageFaceplate(name, pid, fo, lo, hi,
+                                 select_cb=lambda i=i: self._set_selected(i),
+                                 pv_modes=htc1_modes)
+            if not htc1_modes:
+                fp._sp = sp; fp._sp_in.setText(f"{sp:.1f}")
+            self._fp.append(fp); h.addWidget(fp, 1)
+        return f
+
+    # ── Page navigation ─────────────────────────────────
+    def _build_nav_panel(self):
+        _SS = ("QPushButton{background:#001A2E;color:#009EC8;border:2px solid #005577;"
+               "border-radius:6px;font-size:22pt;font-weight:900;}"
+               "QPushButton:hover{background:#003A55;color:#00EEFF;"
+               "border:2px solid #00D4FF;}"
+               "QPushButton:pressed{background:#00D4FF;color:#000A14;"
+               "border:2px solid #00FFFF;}")
+        f = QFrame(); f.setFixedWidth(46)
+        f.setStyleSheet("QFrame{background:#04091A;border-left:2px solid #005577;}")
+        v = QVBoxLayout(f); v.setContentsMargins(5,12,5,12); v.setSpacing(8)
+
+        self._pg_up = QPushButton("▲"); self._pg_up.setFixedSize(36,90)
+        self._pg_dn = QPushButton("▼"); self._pg_dn.setFixedSize(36,90)
+        self._pg_up.setStyleSheet(_SS); self._pg_dn.setStyleSheet(_SS)
+        self._pg_up.clicked.connect(lambda: self._set_page(-1))
+        self._pg_dn.clicked.connect(lambda: self._set_page(+1))
+
+        self._pg_dots = []
+        for _ in range(2):
+            d = QLabel("●"); d.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            d.setFixedHeight(12); d.setStyleSheet("background:transparent;border:none;font-size:8pt;")
+            self._pg_dots.append(d); v.addWidget(d)
+
+        v.insertWidget(0, self._pg_up)
+        v.addStretch()
+        v.addWidget(self._pg_dn)
+        self._refresh_pg_dots()
+        return f
+
+    def _set_page(self, delta):
+        n = self._pages.count()
+        self._pages.setCurrentIndex((self._pages.currentIndex() + delta) % n)
+        self._refresh_pg_dots()
+
+    def _refresh_pg_dots(self):
+        cur = self._pages.currentIndex()
+        for i, d in enumerate(self._pg_dots):
+            d.setStyleSheet("background:transparent;border:none;font-size:8pt;"
+                            + ("color:#00D4FF;" if i == cur else "color:#1A3050;"))
+
+    # ── Formula page ─────────────────────────────────────
+    def _fl(self, key, color="#A8C4DC"):
+        l = QLabel("—")
+        l.setStyleSheet(f"color:{color};font:500 7.5pt Consolas;background:transparent;"
+                        "border:none;letter-spacing:0.2px;")
+        l.setWordWrap(True); self._fv[key] = l; return l
+
+    def _fsec(self, txt, color="#3A6080"):
+        l = QLabel(txt)
+        l.setStyleSheet(f"color:{color};font:700 7pt Consolas;background:transparent;"
+                        "border:none;letter-spacing:1.5px;margin-top:2px;")
+        return l
+
+    def _fcard(self, title, accent, builder_fn):
+        f = QFrame()
+        f.setStyleSheet(f"QFrame{{background:#060C1C;border:1px solid {accent};"
+                        "border-radius:5px;}}")
+        v = QVBoxLayout(f); v.setContentsMargins(7,5,7,5); v.setSpacing(2)
+        hdr = QLabel(title)
+        hdr.setStyleSheet(f"color:{accent};font:700 8.5pt Consolas;background:transparent;"
+                          "border:none;letter-spacing:1px;")
+        v.addWidget(hdr)
+        sep = QFrame(); sep.setFixedHeight(1)
+        sep.setStyleSheet(f"background:{accent};border:none;max-width:9999px;")
+        v.addWidget(sep)
+        builder_fn(v)
+        v.addStretch()
+        return f
+
+    def _build_formula_page(self):
+        outer = QWidget(); outer.setStyleSheet(f"background:{self._BG};")
+        vroot = QVBoxLayout(outer); vroot.setContentsMargins(4,4,4,4); vroot.setSpacing(4)
+
+        ttl = QLabel("  PSYCHROMETRIC PROCESS FORMULA SHEET  ─  REAL-TIME SUBSTITUTED VALUES")
+        ttl.setStyleSheet(f"color:#4A6A8A;font:700 9pt Consolas;letter-spacing:2px;"
+                          f"background:{self._CELL};border:1px solid {self._BDR};"
+                          "border-radius:3px;padding:5px 10px;")
+        vroot.addWidget(ttl)
+
+        scroll = QScrollArea(); scroll.setWidgetResizable(True)
+        scroll.setStyleSheet("QScrollArea{border:none;background:transparent;}"
+                             f"QScrollBar:vertical{{width:8px;background:{self._BG};}}"
+                             "QScrollBar::handle:vertical{background:#1A3050;border-radius:4px;}"
+                             "QScrollBar::add-line:vertical,QScrollBar::sub-line:vertical{height:0;}")
+        inner = QWidget(); inner.setStyleSheet("background:transparent;")
+        g = QGridLayout(inner); g.setContentsMargins(0,0,4,4); g.setSpacing(5)
+        g.setColumnStretch(0,1); g.setColumnStretch(1,1); g.setColumnStretch(2,1)
+
+        cards = [
+            self._fcard("① OA INLET",       _SACCNT[0], self._fbuild_oa),
+            self._fcard("② HTC-1 PREHEAT",  _SACCNT[1], self._fbuild_htc1),
+            self._fcard("③ CC-1 PRECOOL",   _SACCNT[2], self._fbuild_cc1),
+            self._fcard("④ WASHER HUMIDIFY", _SACCNT[3], self._fbuild_washer),
+            self._fcard("⑤ CC-2 DEHUMID",   _SACCNT[4], self._fbuild_cc2),
+            self._fcard("⑥ HTC-2 REHEAT",   _SACCNT[5], self._fbuild_htc2),
+            self._fcard("⑦ SUPPLY FAN",      _SACCNT[6], self._fbuild_fan),
+        ]
+        positions = [(0,0),(0,1),(0,2),(1,0),(1,1),(1,2),(2,0)]
+        spans     = [(1,1),(1,1),(1,1),(1,1),(1,1),(1,1),(1,3)]
+        for card, (r,c), (rs,cs) in zip(cards, positions, spans):
+            g.addWidget(card, r, c, rs, cs)
+
+        scroll.setWidget(inner); vroot.addWidget(scroll, 1)
+        return outer
+
+    # ── Formula card content builders ────────────────────
+    def _fbuild_oa(self, v):
+        v.addWidget(self._fsec("INLET STATE"))
+        v.addWidget(self._fl("oa_state", "#00D4FF"))
+        v.addWidget(self._fsec("SAT. PRESSURE  Pws(T) = 0.611·exp(17.27T/(T+237.3))"))
+        v.addWidget(self._fl("oa_pws"))
+        v.addWidget(self._fsec("PARTIAL PRESSURE  Pw = ω·P / (0.622 + ω),   P=101.325 kPa"))
+        v.addWidget(self._fl("oa_pw"))
+        v.addWidget(self._fsec("ENTHALPY  h = 1.006·T + ω·(2501 + 1.86·T)  [kJ/kg]"))
+        v.addWidget(self._fl("oa_h"))
+        v.addWidget(self._fsec("DEW POINT  Tdp = 237.3·r/(17.27−r),  r = ln(Pw/0.611)"))
+        v.addWidget(self._fl("oa_tdp"))
+        v.addWidget(self._fsec("WET BULB  Twb (bisection on adiabatic saturation line)"))
+        v.addWidget(self._fl("oa_twb"))
+
+    def _fbuild_htc1(self, v):
+        v.addWidget(self._fsec("INLET STATE (= OA)"))
+        v.addWidget(self._fl("htc1_in", "#FF6B35"))
+        v.addWidget(self._fsec("PID — REVERSE ACTION  (SP−PV), Kp=2.5  Ki=0.08"))
+        v.addWidget(self._fl("htc1_pid"))
+        v.addWidget(self._fsec("SENSIBLE HEATING — ω CONSTANT"))
+        v.addWidget(self._fl("htc1_fopdt"))
+        v.addWidget(self._fl("htc1_dT"))
+        v.addWidget(self._fsec("HEAT ENERGY  Q = ṁ·Cpa·ΔT  (ṁ=1 kg/s dry air)"))
+        v.addWidget(self._fl("htc1_Q"))
+        v.addWidget(self._fsec("OUTLET STATE"))
+        v.addWidget(self._fl("htc1_out", "#00FF88"))
+
+    def _fbuild_cc1(self, v):
+        v.addWidget(self._fsec("INLET STATE (= HTC-1 OUT)"))
+        v.addWidget(self._fl("cc1_in", "#00D4FF"))
+        v.addWidget(self._fsec("PID — DIRECT ACTION  (PV−SP), Kp=1.8  Ki=0.05"))
+        v.addWidget(self._fl("cc1_pid"))
+        v.addWidget(self._fsec("DEW POINT CHECK  Tdp_in vs T_out"))
+        v.addWidget(self._fl("cc1_dpcheck"))
+        v.addWidget(self._fsec("CONDENSATION  ω_out = ω_sat(T_out) if T_out < Tdp"))
+        v.addWidget(self._fl("cc1_cond"))
+        v.addWidget(self._fsec("COOLING LOAD  Q = ṁ·(h_in − h_out)"))
+        v.addWidget(self._fl("cc1_Q"))
+        v.addWidget(self._fsec("OUTLET STATE"))
+        v.addWidget(self._fl("cc1_out", "#00FF88"))
+
+    def _fbuild_washer(self, v):
+        v.addWidget(self._fsec("INLET STATE (= CC-1 OUT)"))
+        v.addWidget(self._fl("ws_in", "#00FF9F"))
+        v.addWidget(self._fsec("PID — REVERSE ACTION  (SP−PV on RH), Kp=1.5  Ki=0.10"))
+        v.addWidget(self._fl("ws_pid"))
+        v.addWidget(self._fsec("ADIABATIC HUMIDIFICATION  (等焓加濕 — h ≈ const)"))
+        v.addWidget(self._fl("ws_twb"))
+        v.addWidget(self._fsec("ω_sat(Twb) = 0.622·Pws(Twb) / (P − Pws(Twb))"))
+        v.addWidget(self._fl("ws_wsat"))
+        v.addWidget(self._fsec("EFFECTIVENESS  η = FOPDT_out/100  (capped 0.92)"))
+        v.addWidget(self._fl("ws_eta"))
+        v.addWidget(self._fsec("ω_out = ω_in + η·(ω_sat(Twb) − ω_in)"))
+        v.addWidget(self._fl("ws_wout"))
+        v.addWidget(self._fsec("T_out ≈ Twb + (1−η)·(T_in − Twb)"))
+        v.addWidget(self._fl("ws_Tout"))
+        v.addWidget(self._fsec("MOISTURE ADDED  Δω = ω_out − ω_in"))
+        v.addWidget(self._fl("ws_dw"))
+        v.addWidget(self._fsec("OUTLET STATE"))
+        v.addWidget(self._fl("ws_out", "#00FF88"))
+
+    def _fbuild_cc2(self, v):
+        v.addWidget(self._fsec("INLET STATE (= WASHER OUT)"))
+        v.addWidget(self._fl("cc2_in", "#2E86FF"))
+        v.addWidget(self._fsec("PID — DIRECT ACTION  PV = Tdp_out (出風露點)  SP = target Tdp"))
+        v.addWidget(self._fl("cc2_pid"))
+        v.addWidget(self._fsec("OUTLET DEW POINT  Tdp_out = 237.3·r/(17.27−r), r=ln(Pw_out/0.611)"))
+        v.addWidget(self._fl("cc2_dpformula"))
+        v.addWidget(self._fsec("CONDENSATION  T_out vs Tdp_in — if T_out<Tdp_in: wet coil"))
+        v.addWidget(self._fl("cc2_dpcheck"))
+        v.addWidget(self._fsec("ω_out = ω_sat(T_out) = 0.622·Pws(T_out)/(P−Pws(T_out))"))
+        v.addWidget(self._fl("cc2_cond"))
+        v.addWidget(self._fsec("DEHUMID LOAD  Q = ṁ·(h_in − h_out)"))
+        v.addWidget(self._fl("cc2_Q"))
+        v.addWidget(self._fsec("OUTLET STATE  [SAMPLE: 出風口]"))
+        v.addWidget(self._fl("cc2_out", "#00FF88"))
+
+    def _fbuild_htc2(self, v):
+        v.addWidget(self._fsec("INLET STATE (= CC-2 OUT)"))
+        v.addWidget(self._fl("htc2_in", "#FFB300"))
+        v.addWidget(self._fsec("PID — REVERSE ACTION  PV = T_out (出風乾球溫度)  SP = target T"))
+        v.addWidget(self._fl("htc2_pid"))
+        v.addWidget(self._fsec("SENSIBLE REHEATING — ω CONSTANT (無冷凝)"))
+        v.addWidget(self._fl("htc2_fopdt"))
+        v.addWidget(self._fl("htc2_dT"))
+        v.addWidget(self._fsec("REHEAT ENERGY  Q = ṁ·(1.006+1.86ω)·ΔT  [kW]"))
+        v.addWidget(self._fl("htc2_Q"))
+        v.addWidget(self._fsec("OUTLET STATE  [SAMPLE: 出風口 乾球溫度]"))
+        v.addWidget(self._fl("htc2_out", "#00FF88"))
+
+    def _fbuild_fan(self, v):
+        v.addWidget(self._fsec("INLET STATE (= HTC-2 OUT)"))
+        v.addWidget(self._fl("fan_in", "#BB77FF"))
+        v.addWidget(self._fsec("PID — REVERSE ACTION  (SP−PV on Pa), Kp=0.5  Ki=0.03"))
+        v.addWidget(self._fl("fan_pid"))
+        v.addWidget(self._fsec("STATIC PRESSURE MODEL  P_static = FOPDT(MV_fan)"))
+        v.addWidget(self._fl("fan_ps"))
+        v.addWidget(self._fsec("FAN SPEED  Hz ∝ MV%  (rated 50 Hz @ 100%)"))
+        v.addWidget(self._fl("fan_hz"))
+        v.addWidget(self._fsec("SUPPLY AIR (fan heat gain negligible in model)"))
+        v.addWidget(self._fl("fan_out", "#00FF88"))
+
+    def _update_formula_page(self):
+        if not self._fv: return
+        s = self._states
+        mvs = [p.mv for p in self._pid]
+        fo = self._fo
+
+        # ── OA ───────────────────────────────────────────
+        oa = s[0]
+        pws0 = Psych.pws(oa.T)
+        pw0  = oa.w * Psych.P / (0.62198 + oa.w)
+        self._fv['oa_state'].setText(
+            f"T={oa.T:.1f}°C   ω={oa.w*1000:.2f} g/kg   φ={oa.RH:.1f}%   "
+            f"h={oa.h:.2f} kJ/kg")
+        self._fv['oa_pws'].setText(
+            f"Pws({oa.T:.1f}) = 0.611·exp(17.27×{oa.T:.1f}/({oa.T:.1f}+237.3)) = {pws0:.4f} kPa")
+        self._fv['oa_pw'].setText(
+            f"Pw = {oa.w:.5f}×101.325/(0.622+{oa.w:.5f}) = {pw0:.4f} kPa  →  "
+            f"φ = {pw0:.4f}/{pws0:.4f}×100 = {oa.RH:.1f}%")
+        self._fv['oa_h'].setText(
+            f"h = 1.006×{oa.T:.1f} + {oa.w:.5f}×(2501+1.86×{oa.T:.1f}) = {oa.h:.2f} kJ/kg")
+        self._fv['oa_tdp'].setText(
+            f"r = ln({pw0:.4f}/0.611) = {math.log(max(pw0,1e-9)/0.611):.4f}  →  "
+            f"Tdp = {oa.T_dp:.1f}°C")
+        self._fv['oa_twb'].setText(f"Twb = {oa.T_wb:.1f}°C")
+
+        # ── HTC-1 ─────────────────────────────────────────
+        s0, s1 = s[0], s[1]
+        mv1 = mvs[0]
+        pv_htc1 = s1.h if self._fp[0].pv_mode_idx == 1 else s1.T
+        sp_htc1 = self._fp[0].sp
+        e1 = sp_htc1 - pv_htc1
+        dT1 = s1.T - s0.T
+        Cpa1 = 1.006 + 1.86 * s0.w
+        Q1 = Cpa1 * abs(dT1)
+        self._fv['htc1_in'].setText(
+            f"T={s0.T:.1f}°C  ω={s0.w*1000:.2f} g/kg  φ={s0.RH:.1f}%  "
+            f"Tdp={s0.T_dp:.1f}°C  h={s0.h:.2f} kJ/kg")
+        self._fv['htc1_pid'].setText(
+            f"e = {sp_htc1:.1f} − {pv_htc1:.1f} = {e1:.1f}    MV = {mv1:.1f}%")
+        self._fv['htc1_fopdt'].setText(
+            f"FOPDT: Gain={fo[0].Kp:.2f}  τ={fo[0].tau:.0f}s  L={fo[0].L:.1f}s  "
+            f"heating={'YES' if fo[0].heating else 'NO'}")
+        self._fv['htc1_dT'].setText(
+            f"T_out = T_in+ΔT = {s0.T:.1f}+{dT1:.1f} = {s1.T:.1f}°C   "
+            f"ω_out = ω_in = {s1.w*1000:.2f} g/kg")
+        self._fv['htc1_Q'].setText(
+            f"Q = 1×{Cpa1:.3f}×|{dT1:.1f}| = {Q1:.2f} kW")
+        self._fv['htc1_out'].setText(
+            f"T={s1.T:.1f}°C  ω={s1.w*1000:.2f} g/kg  φ={s1.RH:.1f}%  "
+            f"Tdp={s1.T_dp:.1f}°C  h={s1.h:.2f} kJ/kg")
+
+        # ── CC-1 ──────────────────────────────────────────
+        s1i, s2 = s[1], s[2]
+        mv2 = mvs[1]
+        e2 = s2.T - self._fp[1].sp
+        dT2 = s2.T - s1i.T
+        tdp1 = s1i.T_dp
+        dry2 = s2.T >= tdp1
+        dw2 = (s1i.w - s2.w) * 1000
+        Q2 = abs(s1i.h - s2.h)
+        self._fv['cc1_in'].setText(
+            f"T={s1i.T:.1f}°C  ω={s1i.w*1000:.2f} g/kg  φ={s1i.RH:.1f}%  "
+            f"Tdp={tdp1:.1f}°C  h={s1i.h:.2f} kJ/kg")
+        self._fv['cc1_pid'].setText(
+            f"e = {s2.T:.1f} − {self._fp[1].sp:.1f} = {e2:.1f}    MV = {mv2:.1f}%")
+        self._fv['cc1_dpcheck'].setText(
+            f"Tdp_in={tdp1:.1f}°C   T_out={s2.T:.1f}°C   "
+            f"→ {'DRY (T_out≥Tdp, ω=const)' if dry2 else 'WET (T_out<Tdp, condensation)'}")
+        self._fv['cc1_cond'].setText(
+            f"ω_out = {'ω_in=' if dry2 else 'ω_sat(T_out)='}{s2.w*1000:.2f} g/kg   "
+            f"Condensate Δω={dw2:.2f} g/kg")
+        self._fv['cc1_Q'].setText(f"Q_cool = |{s1i.h:.2f}−{s2.h:.2f}| = {Q2:.2f} kW")
+        self._fv['cc1_out'].setText(
+            f"T={s2.T:.1f}°C  ω={s2.w*1000:.2f} g/kg  φ={s2.RH:.1f}%  "
+            f"Tdp={s2.T_dp:.1f}°C  h={s2.h:.2f} kJ/kg")
+
+        # ── WASHER ────────────────────────────────────────
+        s2i, s3 = s[2], s[3]
+        mv3 = mvs[2]
+        twb2 = s2i.T_wb
+        wsat_wb = Psych.omega_sat(twb2)
+        eta3 = min(0.92, max(0.0, mv3 / 100.0))
+        dw3 = (s3.w - s2i.w) * 1000
+        self._fv['ws_in'].setText(
+            f"T={s2i.T:.1f}°C  ω={s2i.w*1000:.2f} g/kg  φ={s2i.RH:.1f}%  "
+            f"Tdp={s2i.T_dp:.1f}°C  h={s2i.h:.2f} kJ/kg")
+        self._fv['ws_pid'].setText(
+            f"PV(RH)={s3.RH:.1f}%   SP={self._fp[2].sp:.0f}%   "
+            f"e={self._fp[2].sp-s3.RH:.1f}   MV={mv3:.1f}%")
+        self._fv['ws_twb'].setText(f"Twb_in = {twb2:.1f}°C  (bisection)")
+        self._fv['ws_wsat'].setText(
+            f"ω_sat({twb2:.1f}) = {wsat_wb*1000:.3f} g/kg  "
+            f"[Pws={Psych.pws(twb2):.4f} kPa]")
+        self._fv['ws_eta'].setText(f"η = MV/100 = {mv3:.1f}/100 = {eta3:.3f}")
+        self._fv['ws_wout'].setText(
+            f"ω_out = {s2i.w*1000:.3f} + {eta3:.3f}×({wsat_wb*1000:.3f}−{s2i.w*1000:.3f})"
+            f" = {s3.w*1000:.3f} g/kg")
+        self._fv['ws_Tout'].setText(
+            f"T_out = {twb2:.1f}+(1−{eta3:.3f})×({s2i.T:.1f}−{twb2:.1f}) = {s3.T:.1f}°C")
+        self._fv['ws_dw'].setText(f"Δω = {dw3:.2f} g/kg  added")
+        self._fv['ws_out'].setText(
+            f"T={s3.T:.1f}°C  ω={s3.w*1000:.2f} g/kg  φ={s3.RH:.1f}%  "
+            f"Tdp={s3.T_dp:.1f}°C  h={s3.h:.2f} kJ/kg")
+
+        # ── CC-2 ──────────────────────────────────────────
+        s3i, s4 = s[3], s[4]
+        mv4 = mvs[3]
+        tdp4_out = s4.T_dp                        # PV = 出風口露點
+        e4 = tdp4_out - self._fp[3].sp            # direct: PV-SP
+        tdp3 = s3i.T_dp
+        dry4 = s4.T >= tdp3
+        dw4 = (s3i.w - s4.w) * 1000
+        Q4 = abs(s3i.h - s4.h)
+        pw4_out = s4.w * Psych.P / (0.62198 + s4.w)
+        r4 = math.log(max(pw4_out, 1e-9) / 0.611)
+        self._fv['cc2_in'].setText(
+            f"T={s3i.T:.1f}°C  ω={s3i.w*1000:.2f} g/kg  φ={s3i.RH:.1f}%  "
+            f"Tdp={tdp3:.1f}°C  h={s3i.h:.2f} kJ/kg")
+        self._fv['cc2_pid'].setText(
+            f"PV(Tdp_out)={tdp4_out:.1f}°C  SP={self._fp[3].sp:.1f}°C  "
+            f"e={e4:.1f}  MV={mv4:.1f}%")
+        self._fv['cc2_dpformula'].setText(
+            f"Pw_out={pw4_out:.4f} kPa  r=ln(Pw/0.611)={r4:.4f}  "
+            f"Tdp_out=237.3×{r4:.4f}/(17.27−{r4:.4f}) = {tdp4_out:.1f}°C")
+        self._fv['cc2_dpcheck'].setText(
+            f"Tdp_in={tdp3:.1f}°C  T_out={s4.T:.1f}°C  "
+            f"→ {'DRY (T_out≥Tdp_in)' if dry4 else 'WET: T_out<Tdp_in → 冷凝除濕'}")
+        self._fv['cc2_cond'].setText(
+            f"ω_out = {'ω_in (無冷凝)=' if dry4 else 'ω_sat(T_out)='}"
+            f"{s4.w*1000:.3f} g/kg   Δω removed={dw4:.2f} g/kg")
+        self._fv['cc2_Q'].setText(f"Q_dehumid = |{s3i.h:.2f}−{s4.h:.2f}| = {Q4:.2f} kW")
+        self._fv['cc2_out'].setText(
+            f"T={s4.T:.1f}°C  ω={s4.w*1000:.2f} g/kg  φ={s4.RH:.1f}%  "
+            f"Tdp={tdp4_out:.1f}°C  h={s4.h:.2f} kJ/kg")
+
+        # ── HTC-2 ─────────────────────────────────────────
+        s4i, s5 = s[4], s[5]
+        mv5 = mvs[4]
+        e5 = self._fp[4].sp - s5.T              # reverse: SP-PV
+        dT5 = s5.T - s4i.T
+        Cpa5 = 1.006 + 1.86 * s4i.w
+        Q5 = Cpa5 * abs(dT5)
+        self._fv['htc2_in'].setText(
+            f"T={s4i.T:.1f}°C  ω={s4i.w*1000:.2f} g/kg  φ={s4i.RH:.1f}%  "
+            f"Tdp={s4i.T_dp:.1f}°C  h={s4i.h:.2f} kJ/kg")
+        self._fv['htc2_pid'].setText(
+            f"PV(T_out)={s5.T:.1f}°C  SP={self._fp[4].sp:.1f}°C  "
+            f"e={e5:.1f}  MV={mv5:.1f}%")
+        self._fv['htc2_fopdt'].setText(
+            f"FOPDT: Gain={fo[4].Kp:.2f}  τ={fo[4].tau:.0f}s  L={fo[4].L:.1f}s")
+        self._fv['htc2_dT'].setText(
+            f"T_out = T_in+ΔT = {s4i.T:.1f}+{dT5:.1f} = {s5.T:.1f}°C   "
+            f"ω_out = ω_in = {s5.w*1000:.2f} g/kg")
+        self._fv['htc2_Q'].setText(
+            f"Q = 1×(1.006+1.86×{s4i.w:.4f})×|{dT5:.1f}| = {Q5:.2f} kW")
+        self._fv['htc2_out'].setText(
+            f"T={s5.T:.1f}°C  ω={s5.w*1000:.2f} g/kg  φ={s5.RH:.1f}%  "
+            f"Tdp={s5.T_dp:.1f}°C  h={s5.h:.2f} kJ/kg")
+
+        # ── FAN ───────────────────────────────────────────
+        s5i, s6 = s[5], s[6]
+        mv6 = mvs[5]
+        sp_fan = self._fp[5].sp
+        e6 = sp_fan - self._p_static
+        hz = mv6 / 100.0 * 50.0
+        self._fv['fan_in'].setText(
+            f"T={s5i.T:.1f}°C  ω={s5i.w*1000:.2f} g/kg  φ={s5i.RH:.1f}%  "
+            f"Tdp={s5i.T_dp:.1f}°C  h={s5i.h:.2f} kJ/kg")
+        self._fv['fan_pid'].setText(
+            f"e = SP−PV = {sp_fan:.0f}−{self._p_static:.0f} = {e6:.0f} Pa    MV = {mv6:.1f}%")
+        self._fv['fan_ps'].setText(
+            f"P_static = FOPDT(MV={mv6:.1f}%, Gain=40, τ=10s) = {self._p_static:.0f} Pa")
+        self._fv['fan_hz'].setText(
+            f"Hz = MV%×50 = {mv6:.1f}%×50 = {hz:.1f} Hz  (actual: {self._fan_hz:.1f} Hz)")
+        self._fv['fan_out'].setText(
+            f"T={s6.T:.1f}°C  ω={s6.w*1000:.2f} g/kg  φ={s6.RH:.1f}%  "
+            f"Tdp={s6.T_dp:.1f}°C  h={s6.h:.2f} kJ/kg  P_static={self._p_static:.0f} Pa")
+
+    def _build_right(self):
+        f = QFrame(); f.setStyleSheet(f"QFrame{{background:{self._BG};border:none;}}")
+        lay = QVBoxLayout(f); lay.setContentsMargins(0,0,0,0); lay.setSpacing(4)
+        lay.addWidget(self._build_target())
+        self._chart = _PsychrometricChart(); lay.addWidget(self._chart, 1); return f
+
+    def _build_target(self):
+        f = QFrame(); f.setFixedHeight(110)
+        f.setStyleSheet(f"QFrame{{background:{self._CELL};border:1px solid {self._BDR};border-radius:4px;}}")
+        g = QGridLayout(f); g.setContentsMargins(10,8,10,8); g.setSpacing(6)
+        def hdr(t, clr="#7AAABB"):
+            l = QLabel(t); l.setStyleSheet(f"color:{clr};font-size:9pt;font-weight:700;"
+                                            f"background:transparent;border:none;"
+                                            f"font-family:'Microsoft JhengHei','Segoe UI';"); return l
+        def vi(v, clr):
+            e = QLineEdit(str(v)); e.setFixedSize(80, 26); e.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            e.setStyleSheet(f"QLineEdit{{background:#060E1A;color:{clr};"
+                            f"border:1px solid {self._BDR};border-radius:3px;"
+                            f"font-size:11pt;font-weight:700;font-family:Consolas;}}"
+                            f"QLineEdit:focus{{border:1px solid {self._ACC};}}"); return e
+        g.addWidget(hdr("TARGET ZONE CONFIG", self._ACC), 0, 0, 1, 4)
+        g.addWidget(hdr("TEMP SETPOINT"), 1, 0)
+        self._T_sp_in = vi("22","#FF6B6B"); self._T_tol_in = vi("±2","#FF9999")
+        g.addWidget(self._T_sp_in, 1, 1); g.addWidget(self._T_tol_in, 1, 2); g.addWidget(hdr("°C"), 1, 3)
+        g.addWidget(hdr("RH SETPOINT"), 2, 0)
+        self._RH_sp_in = vi("50","#00B4D8"); self._RH_tol_in = vi("±5","#55CCEE")
+        g.addWidget(self._RH_sp_in, 2, 1); g.addWidget(self._RH_tol_in, 2, 2); g.addWidget(hdr("%"), 2, 3)
+        for e in (self._T_sp_in, self._T_tol_in, self._RH_sp_in, self._RH_tol_in):
+            e.editingFinished.connect(self._commit_targets)
+        self._cur_lbl = QLabel("—")
+        self._cur_lbl.setStyleSheet(f"color:{self._ACC};font-size:10pt;font-weight:700;"
+                                    f"background:transparent;border:none;font-family:Consolas;")
+        g.addWidget(hdr("CURRENT STATUS"), 3, 0); g.addWidget(self._cur_lbl, 3, 1, 1, 3)
+        self._T_sp = 22.0; self._RH_sp = 50.0; self._T_tol = 2.0; self._RH_tol = 5.0
+        return f
+
+    # ── helpers ─────────────────────────────────────────
+    def _lbl_w(self, t):
+        l = QLabel(t); l.setStyleSheet(f"color:#BBCCDD;font-size:10pt;font-weight:600;background:transparent;"
+                                        f"border:none;font-family:'Microsoft JhengHei';"); return l
+
+    def _vsep(self):
+        f = QFrame(); f.setFrameShape(QFrame.Shape.VLine)
+        f.setStyleSheet(f"QFrame{{border:none;border-left:1px solid {self._BDR};background:transparent;}}"); return f
+
+    # ── selection ────────────────────────────────────────
+    def _set_selected(self, idx: int):
+        self._sel = idx
+        for i, fp in enumerate(self._fp): fp.set_selected(i == idx)
+        self._schematic.set_selected(idx + 1)
+        self._overlay.set_sel(idx)
+
+    def _on_schematic_click(self, stage_idx: int):
+        fp_idx = stage_idx - 1
+        if 0 <= fp_idx <= 5: self._set_selected(fp_idx)
+        else: self._clear_selection()
+
+    def _clear_selection(self):
+        self._sel = -1
+        for fp in self._fp: fp.set_selected(False)
+        self._schematic.set_selected(-1)
+        self._overlay.set_sel(-1)
+
+    # ── climate ──────────────────────────────────────────
+    def _set_climate(self, mode: str):
+        self._climate = mode; self._update_clim_btns(); self._reset()
+
+    def _update_clim_btns(self):
+        is_w = (self._climate == "Winter")
+        _pill = "border-radius:18px;font-size:10pt;font-weight:700;font-family:Consolas;padding:0 14px;"
+        _as = (f"QPushButton{{background:#FF6B00;color:#FFFFFF;border:none;{_pill}}}"
+               f"QPushButton:hover{{background:#FF8822;}}")
+        _aw = (f"QPushButton{{background:#003A6A;color:#00B4D8;border:none;{_pill}}}"
+               f"QPushButton:hover{{background:#004A8A;}}")
+        _off = (f"QPushButton{{background:#0E1828;color:#3A5570;border:none;{_pill}}}")
+        self._btn_summer.setStyleSheet(_as if not is_w else _off)
+        self._btn_winter.setStyleSheet(_aw if is_w else _off)
+
+    def _commit_targets(self):
+        try: self._T_sp   = float(self._T_sp_in.text())
+        except: pass
+        try: self._T_tol  = abs(float(self._T_tol_in.text().replace("±","")))
+        except: pass
+        try: self._RH_sp  = float(self._RH_sp_in.text())
+        except: pass
+        try: self._RH_tol = abs(float(self._RH_tol_in.text().replace("±","")))
+        except: pass
+
+    # ── simulation ───────────────────────────────────────
+    def _oa(self):
+        if self._climate == "Summer": return AirState(37.0, Psych.omega(37.0, 65.0))
+        return AirState(6.0, Psych.omega(6.0, 50.0))
+
+    def _reset(self):
+        if not hasattr(self, "_timer"): return
+        self._timer.stop(); oa = self._oa()
+        self._states = [oa.copy() for _ in range(7)]
+        self._fan_hz = 45.0; self._p_static = 2000.0
+        for pid in self._pid: pid.reset()
+        for fo in self._fo: fo.reset()
+        self._timer.start(50)
+
+    def _tick(self):
+        for _ in range(self._speed): self._step(self._DT)
+        self._update_ui()
+
+    def _step(self, dt):
+        oa = self._oa(); s = [oa.copy() for _ in range(7)]
+
+        # Fan (compute first for coupling)
+        mv_fan = self._pid[5].compute(self._p_static, self._fp[5].sp, dt)
+        self._fan_hz = 30.0 + (mv_fan / 100.0) * 30.0
+        fan_sc = 45.0 / max(self._fan_hz, 1.0)
+        # FOPDT pressure lag: Kp=40 → at 100%MV steady=4000Pa
+        self._p_static = max(100.0, self._fo[5].step(mv_fan, dt, 1.0))
+
+        # HTC-1: preheat (PV = T°C or enthalpy kJ/kg depending on user selection)
+        pv_htc1 = self._states[1].h if self._fp[0].pv_mode_idx == 1 else self._states[1].T
+        mv1 = self._pid[0].compute(pv_htc1, self._fp[0].sp, dt)
+        s[1] = AirState(T=oa.T + self._fo[0].step(mv1, dt, fan_sc), w=oa.w)
+
+        # CC-1: precool, condensation check
+        mv2 = self._pid[1].compute(self._states[2].T, self._fp[1].sp, dt)
+        T2 = s[1].T + self._fo[1].step(mv2, dt, fan_sc); w2 = s[1].w
+        if T2 < Psych.t_dp(w2): w2 = max(0.0, Psych.omega_sat(T2))
+        s[2] = AirState(T=T2, w=w2)
+
+        # Washer: adiabatic humidification with FOPDT lag on effectiveness
+        mv3 = self._pid[2].compute(self._states[3].RH, self._fp[2].sp, dt)
+        # fo[2] Kp=1.0: step(mv3) → 0..100 at ss, /100 → 0..1, cap at 0.92
+        eta = min(0.92, max(0.0, self._fo[2].step(mv3, dt, 1.0) / 100.0))
+        T_wb = Psych.t_wb(s[2].T, s[2].w); w_sat_wb = Psych.omega_sat(T_wb)
+        T3 = s[2].T - eta * (s[2].T - T_wb)
+        w3 = min(s[2].w + eta * (w_sat_wb - s[2].w), Psych.omega_sat(T3))
+        s[3] = AirState(T=T3, w=w3)
+
+        # CC-2: dehumidify — PV = outlet dew point (取樣在出風口)
+        mv4 = self._pid[3].compute(self._states[4].T_dp, self._fp[3].sp, dt)
+        T4 = max(2.0, s[3].T + self._fo[3].step(mv4, dt, fan_sc)); w4 = s[3].w
+        if T4 < Psych.t_dp(s[3].w): w4 = max(0.0, Psych.omega_sat(T4))
+        s[4] = AirState(T=T4, w=w4)
+
+        # HTC-2: reheat
+        mv5 = self._pid[4].compute(self._states[5].T, self._fp[4].sp, dt)
+        s[5] = AirState(T=s[4].T + self._fo[4].step(mv5, dt, fan_sc), w=s[4].w)
+
+        s[6] = s[5].copy(); self._states = s
+
+    def _update_ui(self):
+        mvs = [p.mv for p in self._pid]
+        self._schematic.refresh(self._states, mvs, self._p_static, self._fan_hz)
+
+        oa = self._states[0]
+        self._oa_T_lbl.setText(f"{oa.T:.1f}°C")
+        self._oa_RH_lbl.setText(f"{oa.RH:.0f}%")
+
+        pv_htc1_disp = self._states[1].h if self._fp[0].pv_mode_idx == 1 else self._states[1].T
+        pv_vals = [pv_htc1_disp, self._states[2].T, self._states[3].RH,
+                   self._states[4].T_dp, self._states[5].T, self._p_static]
+        for fp, pv, mv in zip(self._fp, pv_vals, mvs): fp.update_display(pv, mv)
+
+        self._chart.refresh(self._states, self._T_sp, self._RH_sp,
+                            self._T_tol, self._RH_tol, sel=self._sel)
+        self._update_formula_page()
+
+        sa = self._states[6]
+        self._final_T_lbl.setText(f"{sa.T:.1f}°C")
+        self._final_lbl.setText(f"{sa.RH:.0f}%")
+        in_T = abs(sa.T - self._T_sp) <= self._T_tol
+        in_RH = abs(sa.RH - self._RH_sp) <= self._RH_tol
+        ok = in_T and in_RH
+        self._cur_lbl.setStyleSheet(
+            f"color:{'#00FF88' if ok else '#FF4433'};font-size:8.5pt;font-weight:700;"
+            f"background:transparent;border:none;font-family:Consolas;")
+        self._cur_lbl.setText(
+            f"{sa.T:.1f} °C   {sa.RH:.0f}% RH   {'✓ ON TARGET' if ok else '✗ OFF TARGET'}")
+
+    # ── lifecycle ────────────────────────────────────────
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        if hasattr(self, '_overlay'):
+            self._overlay.setGeometry(self.content.rect())
+            self._overlay.raise_()
+
+    def showEvent(self, e):
+        super().showEvent(e)
+        if not self._timer.isActive(): self._timer.start(50)
+        scr = QApplication.primaryScreen()
+        if scr:
+            ag = scr.availableGeometry()
+            self.resize(ag.width(), ag.height()); self.move(ag.left(), ag.top())
+        if hasattr(self, '_overlay'):
+            self._overlay.setGeometry(self.content.rect())
+            self._overlay.raise_()
+
+    def hideEvent(self, e):
+        self._timer.stop(); super().hideEvent(e)
+
+    def closeEvent(self, e):
+        self._timer.stop(); super().closeEvent(e)

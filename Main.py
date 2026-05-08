@@ -20,6 +20,7 @@ from tool_pid_vfd        import VfdPressureTuner
 from tool_unit_converter import UnitConverterTool
 from tool_advanced_calc  import AdvancedCalcTool
 from tool_pid_drycool    import AhuDryCoolTuner
+from tool_pid_mau        import MauSimulator
 
 # ═══════════════════════════════════════════════════════
 #  YS LOGO  (drawn programmatically — no image files)
@@ -94,6 +95,22 @@ class LauncherBar(QWidget):
         lay = QVBoxLayout(self)
         lay.setContentsMargins(6, 8, 6, 8); lay.setSpacing(4)
         for lbl, cb in buttons.items():
+            if cb is None:
+                # Section header / separator label
+                sep = QFrame()
+                sep.setFrameShape(QFrame.Shape.HLine)
+                sep.setStyleSheet("QFrame{border:none;border-top:1px solid "
+                                  "rgba(255,255,255,0.10);background:transparent;}")
+                sep.setFixedHeight(1)
+                lay.addWidget(sep)
+                hdr = QLabel(lbl)
+                hdr.setFixedHeight(20)
+                hdr.setStyleSheet(
+                    "QLabel{color:rgba(255,128,0,180);font-size:10px;"
+                    "font-family:'Microsoft JhengHei','Segoe UI',sans-serif;"
+                    "font-weight:bold;padding:0 6px;background:transparent;}")
+                lay.addWidget(hdr)
+                continue
             btn = QPushButton(lbl); btn.setFixedHeight(36)
             btn.setStyleSheet(
                 "QPushButton{background:rgba(38,38,38,220);color:#c6c6c6;"
@@ -173,15 +190,19 @@ class ClawdeWindow(QWidget):
         self.unit_conv = UnitConverterTool()
         self.adv_calc  = AdvancedCalcTool()
         self.ahu_cool  = AhuDryCoolTuner()
+        self.mau_sim   = MauSimulator()
 
         # Launcher
         self.launcher = LauncherBar({
-            "🌐 IP 監控器":      self._open_ip,
-            "⚙️ PID Tuner":     self._open_pid,
-            "⚡ VFD 壓力控制":   self._open_vfd,
-            "❄️ AHU 冷卻盤管":  self._open_ahu,
-            "📐 單位換算器":     self._open_unit,
-            "🔬 進階計算器":     self._open_adv,
+            "━━  工具  ━━━━━━━━━━━━━": None,
+            "🌐 IP 監控器":             self._open_ip,
+            "📐 單位換算器":             self._open_unit,
+            "🔬 進階計算器":             self._open_adv,
+            "━━  PID 控制  ━━━━━━━━": None,
+            "⚙️ PID Tuner":            self._open_pid,
+            "⚡ VFD 壓力控制":          self._open_vfd,
+            "❄️ AHU 冷卻盤管":         self._open_ahu,
+            "🌬️ MAU 空調箱":           self._open_mau,
         }, close_cb=QApplication.instance().quit)
 
         self._drag_pos = QPoint()
@@ -199,6 +220,9 @@ class ClawdeWindow(QWidget):
 
     def _open_ahu(self):
         self.ahu_cool.center_near(self.pos()); self.ahu_cool.show(); self.ahu_cool.raise_()
+
+    def _open_mau(self):
+        self.mau_sim.center_near(self.pos()); self.mau_sim.show(); self.mau_sim.raise_()
 
     def _open_unit(self):
         self.unit_conv.center_near(self.pos()); self.unit_conv.show(); self.unit_conv.raise_()

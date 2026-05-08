@@ -1786,6 +1786,14 @@
    'C:\\Users\\user\\Documents\\Claude\\Projects\\Claude desktop '
    'assistant\\project1\\tool_pid.py',
    'PYMODULE'),
+  ('tool_pid_drycool',
+   'C:\\Users\\user\\Documents\\Claude\\Projects\\Claude desktop '
+   'assistant\\project1\\tool_pid_drycool.py',
+   'PYMODULE'),
+  ('tool_pid_mau',
+   'C:\\Users\\user\\Documents\\Claude\\Projects\\Claude desktop '
+   'assistant\\project1\\tool_pid_mau.py',
+   'PYMODULE'),
   ('tool_pid_vfd',
    'C:\\Users\\user\\Documents\\Claude\\Projects\\Claude desktop '
    'assistant\\project1\\tool_pid_vfd.py',

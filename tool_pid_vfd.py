@@ -31,7 +31,7 @@ class VfdPressureTuner(PidTunerBuddy):
         super().__init__(on_thinking)
         self.resize(1060, self.height())
         self.setMinimumWidth(860)
-        # _h_lay already contains [hmi_panel | scroll] from parent
+        # _h_lay already contains [hmi_panel | scroll | right_frame] from parent
         self._anim_panel = self._build_anim_panel()
         self._h_lay.addWidget(self._anim_panel, 1)
 
@@ -52,7 +52,7 @@ class VfdPressureTuner(PidTunerBuddy):
         panel = QFrame(self.content)
         panel.setMinimumWidth(280)
         panel.setStyleSheet(
-            f"QFrame{{background:{self._BG};"
+            f"QFrame{{background:#040A18;"
             f"border-left:1px solid {self._BORDER};}}")
 
         lay = QVBoxLayout(panel)
@@ -76,8 +76,8 @@ class VfdPressureTuner(PidTunerBuddy):
         info = QFrame()
         info.setFixedHeight(58)
         info.setStyleSheet(
-            "QFrame{background:#0A1018;"
-            "border:1px solid #152030;border-radius:4px;}")
+            f"QFrame{{background:#08101E;"
+            f"border:1px solid {self._BORDER};border-radius:4px;}}")
         ih = QHBoxLayout(info)
         ih.setContentsMargins(10, 6, 10, 6)
         ih.setSpacing(0)
@@ -86,7 +86,7 @@ class VfdPressureTuner(PidTunerBuddy):
             col = QVBoxLayout(); col.setSpacing(1); col.setContentsMargins(4, 0, 4, 0)
             t = QLabel(tag)
             t.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            t.setStyleSheet("color:#404050;font-size:7pt;font-weight:600;"
+            t.setStyleSheet(f"color:{self._LBL2};font-size:7pt;font-weight:600;"
                             "background:transparent;border:none;"
                             "font-family:'Microsoft JhengHei','Segoe UI';")
             v = QLabel(init)
@@ -99,13 +99,13 @@ class VfdPressureTuner(PidTunerBuddy):
 
         def _sep():
             f = QFrame(); f.setFrameShape(QFrame.Shape.VLine)
-            f.setStyleSheet("QFrame{border:none;border-left:1px solid #1A3050;"
+            f.setStyleSheet(f"QFrame{{border:none;border-left:1px solid {self._BORDER};"
                             "background:transparent;}")
             return f
 
-        self._anim_pa_val, pa_lay = _val_col("壓力  PV", "0.00 Pa", self._OK)
+        self._anim_pa_val, pa_lay = _val_col("壓力  PV", "0.00 Pa", self._PV_CLR)
         self._anim_sv_val, sv_lay = _val_col("設定  SV", "2.50 Pa", self._SV_CLR)
-        self._anim_hz_val, hz_lay = _val_col("頻率  Hz", "30.0 Hz", self._ACC)
+        self._anim_hz_val, hz_lay = _val_col("頻率  Hz", "30.0 Hz", self._MV_CLR)
 
         ih.addLayout(pa_lay, 1)
         ih.addWidget(_sep())
@@ -126,16 +126,16 @@ class VfdPressureTuner(PidTunerBuddy):
 
     def _pp_qss(self, paused: bool) -> str:
         if paused:
-            return ("QPushButton{background:#0A2A0A;color:#00FF88;"
-                    "border:1px solid #1A4A1A;border-radius:6px;"
+            return (f"QPushButton{{background:#040E04;color:{self._OK};"
+                    f"border:1px solid #0A2A0A;border-radius:6px;"
                     "font-size:10pt;font-weight:700;"
                     "font-family:'Microsoft JhengHei','Segoe UI';}"
-                    "QPushButton:hover{background:#143A14;color:#FFF;}")
-        return ("QPushButton{background:#1A1A2A;color:#8888FF;"
-                "border:1px solid #2A2A4A;border-radius:6px;"
+                    "QPushButton:hover{background:#0A1E0A;color:#FFF;}")
+        return (f"QPushButton{{background:{self._CELL};color:{self._ACC};"
+                f"border:1px solid {self._BORDER};border-radius:6px;"
                 "font-size:10pt;font-weight:700;"
                 "font-family:'Microsoft JhengHei','Segoe UI';}"
-                "QPushButton:hover{background:#22224A;color:#FFF;}")
+                f"QPushButton:hover{{background:{self._BG};color:#FFF;}}")
 
     def _toggle_pause(self):
         self._pp_paused = not self._pp_paused
@@ -174,71 +174,55 @@ class VfdPressureTuner(PidTunerBuddy):
     # ════════════════════════════════════════════════════
 
     def _build_param_cols(self, lay):
+        """VFD-specific param panel — goes into the right_frame from parent."""
         # ── VFD defaults (set before parent reads them for UI init) ──
         self._pK, self._pT, self._pL = 0.85, 5.0, 2.0
         self._Kp, self._Ki, self._Kd = 1.0,  0.5, 0.0
 
-        _eq  = ("color:#00E5A0;font-size:9pt;font-weight:700;"
-                "background:transparent;border:none;"
-                "font-family:Consolas,'Courier New';")
-        _sep = ("color:#2A4A3A;font-size:7pt;"
-                "background:transparent;border:none;"
-                "font-family:Consolas,'Courier New';")
-        _ann = ("color:#80C8A8;font-size:8.5pt;font-weight:600;"
-                "background:transparent;border:none;"
-                "font-family:'Microsoft JhengHei','Segoe UI';")
+        _sep = (f"color:{self._BORDER};font-size:7pt;"
+                f"background:transparent;border:none;"
+                f"font-family:Consolas,'Courier New';")
+        _ann = (f"color:{self._LBL};font-size:8.5pt;font-weight:600;"
+                f"background:transparent;border:none;"
+                f"font-family:'Microsoft JhengHei','Segoe UI';")
 
-        lay.addWidget(self._sec_hdr("≡  主要參數  Controller & Process Parameters"))
-        cols = QHBoxLayout(); cols.setSpacing(10)
+        lay.addWidget(self._sec_hdr("≡  主要參數  Parameters"))
 
-        def _div():
-            d = QFrame(); d.setFrameShape(QFrame.Shape.VLine)
-            d.setStyleSheet("QFrame{border:none;border-left:1px solid #242424;"
-                            "background:transparent;}"); return d
-
-        def _framed(hdr, formulas):
+        def _framed_section(hdr_text: str, formula_block: list) -> tuple:
             fr = QFrame()
-            fr.setStyleSheet(f"QFrame{{background:{self._CELL};"
+            fr.setStyleSheet(f"QFrame{{background:{self._BG};"
                              f"border:1px solid {self._ACC};border-radius:4px;}}")
-            outer = QHBoxLayout(fr)
-            outer.setContentsMargins(8, 6, 8, 6); outer.setSpacing(8)
-            lv = QVBoxLayout(); lv.setSpacing(3); lv.setContentsMargins(0, 0, 0, 0)
-            hl = QLabel(hdr)
-            hl.setStyleSheet(f"color:{self._ACC};font-size:8.5pt;font-weight:700;"
+            flay = QVBoxLayout(fr)
+            flay.setContentsMargins(8, 6, 8, 6); flay.setSpacing(6)
+            hl = QLabel(hdr_text)
+            hl.setStyleSheet(f"color:{self._ACC};font-size:9.5pt;font-weight:700;"
                              f"background:transparent;border:none;padding-bottom:3px;"
                              f"font-family:'Microsoft JhengHei','Segoe UI';")
-            lv.addWidget(hl)
-            outer.addLayout(lv, 0)
-            outer.addWidget(_div())
-            rv = QVBoxLayout(); rv.setSpacing(1); rv.setContentsMargins(4, 0, 4, 0)
-            for text, style in formulas:
+            flay.addWidget(hl)
+            param_lay = QVBoxLayout(); param_lay.setSpacing(3)
+            flay.addLayout(param_lay)
+            for text, style in formula_block:
                 fl = QLabel(text); fl.setStyleSheet(style); fl.setWordWrap(True)
-                rv.addWidget(fl)
-            rv.addStretch()
-            outer.addLayout(rv, 1)
-            return fr, lv
+                flay.addWidget(fl)
+            return fr, param_lay
 
         pid_formula = [
-            ("PID 控制核心  Control Core",                              _eq),
-            ("────────────────────────────────────────",               _sep),
-            ("比對 SV 與 PV 誤差，計算 MV 輸出以消除誤差",             _ann),
-            ("P (比例)  ─  依據當前誤差即時反應",                      _ann),
-            ("I (積分)  ─  累積誤差，消除穩態誤差",                    _ann),
-            ("D (微分)  ─  預測誤差趨勢，抑制劇烈變動",               _ann),
-            ("─  MV = Kp·[e + (1/Ti)·∫e dt + Td·de/dt]",            _sep),
+            ("────────────────────────",               _sep),
+            ("P  ─  依據當前誤差即時反應",              _ann),
+            ("I  ─  累積誤差，消除穩態誤差",            _ann),
+            ("D  ─  預測誤差趨勢，抑制劇烈變動",       _ann),
+            ("MV = Kp·[e + Ki·∫e + Kd·de/dt]",       _sep),
         ]
         fopdt_formula = [
-            ("FOPDT 物理模型  Process Model",                           _eq),
-            ("────────────────────────────────────────",               _sep),
-            ("簡化工業動態：一階延遲 + 純滯後數學模型",                _ann),
-            ("K  (增益)    ─  MV 變化量造成的 PV 改變幅度",            _ann),
-            ("τ  (時間常數) ─  達最終值 63.2% 所需時間",              _ann),
-            ("L  (延遲)    ─  MV 改變到 PV 開始反應的時間",            _ann),
-            ("─  PV = PV₀ + K·ΔMV·(1 − e^(−(t−L)/τ))",             _sep),
+            ("────────────────────────",               _sep),
+            ("K  ─  MV 變化量造成的 PV 改變幅度",      _ann),
+            ("τ  ─  達最終值 63.2% 所需時間",          _ann),
+            ("L  ─  MV 改變到 PV 開始反應的時間",      _ann),
+            ("PV = K·MV·(1 − e^(−(t−L)/τ))",         _sep),
         ]
 
-        pid_fr,   pid_col   = _framed("動態控制  PID",   pid_formula)
-        fopdt_fr, fopdt_col = _framed("物理模型  FOPDT", fopdt_formula)
+        pid_fr,   pid_col   = _framed_section("PID 控制核心", pid_formula)
+        fopdt_fr, fopdt_col = _framed_section("FOPDT 物理模型", fopdt_formula)
 
         for attr, label, lo, hi, dec in self._PID_SPECS:
             le = self._param_row(pid_col, attr, label, lo, hi, dec, "")
@@ -247,8 +231,9 @@ class VfdPressureTuner(PidTunerBuddy):
         for attr, label, lo, hi, dec, unit in self._FOPDT_SPECS:
             self._param_row(fopdt_col, attr, label, lo, hi, dec, unit)
 
-        cols.addWidget(pid_fr, 1); cols.addWidget(fopdt_fr, 1)
-        lay.addLayout(cols)
+        lay.addWidget(pid_fr)
+        lay.addWidget(fopdt_fr)
+        lay.addStretch()
 
     def _build_plot(self, lay):
         super()._build_plot(lay)
@@ -281,9 +266,9 @@ class VfdPressureTuner(PidTunerBuddy):
 
         self._hover_lbl.setHtml(
             f'<span style="color:#888888">t = {ta[idx]:.1f} s</span><br/>'
-            f'<span style="color:#00FF88">PV = {pv_pa:.2f} Pa</span><br/>'
-            f'<span style="color:#FF4455">SV = {sv_pa:.2f} Pa</span><br/>'
-            f'<span style="color:#FF8800">Hz = {hz:.1f}</span>')
+            f'<span style="color:{self._PV_CLR}">PV = {pv_pa:.2f} Pa</span><br/>'
+            f'<span style="color:{self._SV_CLR}">SV = {sv_pa:.2f} Pa</span><br/>'
+            f'<span style="color:{self._MV_CLR}">Hz = {hz:.1f}</span>')
 
         xr, yr = (self._pw.plotItem.vb.viewRange()[0],
                   self._pw.plotItem.vb.viewRange()[1])
@@ -320,7 +305,7 @@ class VfdPressureTuner(PidTunerBuddy):
                 f"font-variant-numeric:tabular-nums;")
             unit = QLabel("Pa")
             unit.setStyleSheet(
-                f"color:#606060;font-size:10pt;font-weight:600;"
+                f"color:{self._LBL2};font-size:10pt;font-weight:600;"
                 f"background:transparent;border:none;"
                 f"font-family:'Segoe UI';padding-bottom:2px;")
             unit.setAlignment(Qt.AlignmentFlag.AlignBottom)
@@ -343,8 +328,8 @@ class VfdPressureTuner(PidTunerBuddy):
         """Large Pa / Hz display with range labels."""
         f = QFrame()
         f.setStyleSheet(
-            "QFrame{background:#0D1A12;"
-            "border:1px solid #1A4A2A;border-radius:4px;}")
+            f"QFrame{{background:{self._CELL};"
+            f"border:1px solid {self._BORDER};border-radius:4px;}}")
         f.setFixedHeight(82)
         outer = QHBoxLayout(f)
         outer.setContentsMargins(14, 6, 14, 6)
@@ -373,17 +358,17 @@ class VfdPressureTuner(PidTunerBuddy):
             rw.addWidget(val); rw.addWidget(utag); rw.addStretch()
             rng = QLabel(f"MAX {hi:.0f} {unit}    MIN {lo:.0f} {unit}")
             rng.setStyleSheet(
-                "color:#505050;font-size:7.5pt;font-weight:600;"
+                f"color:{self._LBL2};font-size:7.5pt;font-weight:600;"
                 "background:transparent;border:none;"
                 "font-family:'Segoe UI';")
             col.addWidget(hdr); col.addLayout(rw); col.addWidget(rng)
             return col, val
 
         pa_col, self._pa_disp = _col(
-            "壓力  Pressure", "Pa", self._OK,
+            "壓力  Pressure", "Pa", self._PV_CLR,
             self._PRESS_MIN, self._PRESS_MAX)
         hz_col, self._hz_disp = _col(
-            "VFD 頻率  Frequency", "Hz", self._ACC,
+            "VFD 頻率  Frequency", "Hz", self._MV_CLR,
             self._FREQ_MIN, self._FREQ_MAX)
 
         outer.addLayout(pa_col, 1)
