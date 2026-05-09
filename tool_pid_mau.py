@@ -1174,6 +1174,7 @@ class MauSimulator(BaseToolWindow):
         super().__init__("🌬️ MAU PRO-SIM 7X   Industrial Psychrometrics Engine", 1400, 900)
         self.setMinimumSize(900, 600); self.content.setStyleSheet(f"background:{self._BG};")
         self._climate = "Winter"; self._speed = 1; self._sel = -1
+        self._custom_T = 20.0; self._custom_RH = 60.0
         self._states = [AirState(6.0, Psych.omega(6.0, 50.0))] * 7
         self._fan_hz = 45.0; self._p_static = 2000.0
 
@@ -1230,18 +1231,67 @@ class MauSimulator(BaseToolWindow):
         h = QHBoxLayout(f); h.setContentsMargins(18, 10, 18, 10); h.setSpacing(18)
 
         # ── CLIMATE PROFILE ──────────────────────────────
-        cp_v = QVBoxLayout(); cp_v.setSpacing(8); cp_v.setContentsMargins(0,0,0,0)
+        cp_v = QVBoxLayout(); cp_v.setSpacing(6); cp_v.setContentsMargins(0,0,0,0)
         cap_cp = QLabel("CLIMATE PROFILE")
         cap_cp.setStyleSheet("color:#4A6A8A;font-size:8pt;font-weight:700;background:transparent;"
                              "border:none;font-family:Consolas;letter-spacing:2px;")
         cp_v.addWidget(cap_cp)
         br = QHBoxLayout(); br.setSpacing(8); br.setContentsMargins(0,0,0,0)
-        self._btn_summer = QPushButton("SUMMER"); self._btn_summer.setFixedHeight(36)
-        self._btn_winter = QPushButton("WINTER"); self._btn_winter.setFixedHeight(36)
+        self._btn_summer = QPushButton("SUMMER"); self._btn_summer.setFixedHeight(34)
+        self._btn_winter = QPushButton("WINTER"); self._btn_winter.setFixedHeight(34)
+        self._btn_custom = QPushButton("CUSTOM"); self._btn_custom.setFixedHeight(34)
         self._btn_summer.clicked.connect(lambda: self._set_climate("Summer"))
         self._btn_winter.clicked.connect(lambda: self._set_climate("Winter"))
-        br.addWidget(self._btn_summer); br.addWidget(self._btn_winter)
-        cp_v.addLayout(br); h.addLayout(cp_v)
+        self._btn_custom.clicked.connect(lambda: self._set_climate("Custom"))
+        br.addWidget(self._btn_summer); br.addWidget(self._btn_winter); br.addWidget(self._btn_custom)
+        cp_v.addLayout(br)
+
+        # Custom OA input row (shown only when CUSTOM is active)
+        self._custom_row = QWidget()
+        self._custom_row.setStyleSheet("QWidget{background:transparent;border:none;}")
+        cr = QHBoxLayout(self._custom_row)
+        cr.setContentsMargins(2, 2, 0, 0); cr.setSpacing(5)
+        def _clbl(t):
+            l = QLabel(t); l.setStyleSheet("color:#7AAABB;font-size:9pt;font-weight:700;"
+                                           "background:transparent;border:none;font-family:Consolas;")
+            return l
+        def _cinp(val, clr, w=62):
+            e = QLineEdit(val); e.setFixedSize(w, 24); e.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            e.setStyleSheet(f"QLineEdit{{background:#060E1A;color:{clr};"
+                            f"border:1px solid #1A3050;border-radius:3px;"
+                            f"font-size:10pt;font-weight:700;font-family:Consolas;}}"
+                            f"QLineEdit:focus{{border:1px solid #00B4D8;}}")
+            return e
+        def _arrows(le, step, lo, hi, fmt=".1f"):
+            vw = QWidget(); vl = QVBoxLayout(vw)
+            vl.setContentsMargins(0,0,0,0); vl.setSpacing(1)
+            def _adj(d):
+                try: cur = float(le.text())
+                except: return
+                le.setText(format(max(lo, min(hi, cur + d)), fmt))
+                self._commit_custom()
+            for sym, d in [("▲", step), ("▼", -step)]:
+                b = QPushButton(sym); b.setFixedSize(18, 11)
+                b.setStyleSheet("QPushButton{background:#0E1C2E;color:#7AAFDF;"
+                                "border:1px solid #1A3050;border-radius:2px;font-size:7px;padding:0;}"
+                                "QPushButton:hover{background:#1A3050;color:#AADDFF;}"
+                                "QPushButton:pressed{background:#2A5080;}")
+                b.clicked.connect(lambda _, d=d: _adj(d))
+                vl.addWidget(b)
+            return vw
+        self._custom_T_in  = _cinp(f"{self._custom_T:.1f}",  "#FFAA55")
+        self._custom_RH_in = _cinp(f"{self._custom_RH:.0f}", "#55DDEE", 54)
+        self._custom_T_in.editingFinished.connect(self._commit_custom)
+        self._custom_RH_in.editingFinished.connect(self._commit_custom)
+        cr.addWidget(_clbl("T")); cr.addWidget(self._custom_T_in)
+        cr.addWidget(_arrows(self._custom_T_in, 0.5, -20.0, 55.0))
+        cr.addWidget(_clbl("°C")); cr.addSpacing(10)
+        cr.addWidget(_clbl("RH")); cr.addWidget(self._custom_RH_in)
+        cr.addWidget(_arrows(self._custom_RH_in, 1.0, 10.0, 100.0, ".0f"))
+        cr.addWidget(_clbl("%")); cr.addStretch()
+        self._custom_row.setVisible(False)
+        cp_v.addWidget(self._custom_row)
+        h.addLayout(cp_v)
         self._update_clim_btns()
 
         # ── Divider ──────────────────────────────────────
@@ -1872,15 +1922,25 @@ class MauSimulator(BaseToolWindow):
         self._climate = mode; self._update_clim_btns(); self._reset()
 
     def _update_clim_btns(self):
-        is_w = (self._climate == "Winter")
+        clim = self._climate
         _pill = "border-radius:18px;font-size:10pt;font-weight:700;font-family:Consolas;padding:0 14px;"
-        _as = (f"QPushButton{{background:#FF6B00;color:#FFFFFF;border:none;{_pill}}}"
-               f"QPushButton:hover{{background:#FF8822;}}")
-        _aw = (f"QPushButton{{background:#003A6A;color:#00B4D8;border:none;{_pill}}}"
-               f"QPushButton:hover{{background:#004A8A;}}")
+        _as  = (f"QPushButton{{background:#FF6B00;color:#FFFFFF;border:none;{_pill}}}"
+                f"QPushButton:hover{{background:#FF8822;}}")
+        _aw  = (f"QPushButton{{background:#003A6A;color:#00B4D8;border:none;{_pill}}}"
+                f"QPushButton:hover{{background:#004A8A;}}")
+        _ac  = (f"QPushButton{{background:#1A5A2A;color:#44FF88;border:none;{_pill}}}"
+                f"QPushButton:hover{{background:#2A7A3A;}}")
         _off = (f"QPushButton{{background:#0E1828;color:#3A5570;border:none;{_pill}}}")
-        self._btn_summer.setStyleSheet(_as if not is_w else _off)
-        self._btn_winter.setStyleSheet(_aw if is_w else _off)
+        self._btn_summer.setStyleSheet(_as if clim == "Summer" else _off)
+        self._btn_winter.setStyleSheet(_aw if clim == "Winter" else _off)
+        self._btn_custom.setStyleSheet(_ac if clim == "Custom" else _off)
+        self._custom_row.setVisible(clim == "Custom")
+
+    def _commit_custom(self):
+        try: self._custom_T  = max(-20.0, min(55.0,  float(self._custom_T_in.text())))
+        except: pass
+        try: self._custom_RH = max(10.0,  min(100.0, float(self._custom_RH_in.text())))
+        except: pass
 
     def _commit_targets(self):
         try: self._T_sp   = float(self._T_sp_in.text())
@@ -1895,6 +1955,7 @@ class MauSimulator(BaseToolWindow):
     # ── simulation ───────────────────────────────────────
     def _oa(self):
         if self._climate == "Summer": return AirState(37.0, Psych.omega(37.0, 65.0))
+        if self._climate == "Custom": return AirState(self._custom_T, Psych.omega(self._custom_T, self._custom_RH))
         return AirState(6.0, Psych.omega(6.0, 50.0))
 
     def _reset(self):
