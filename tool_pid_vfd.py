@@ -302,7 +302,7 @@ class VfdPressureTuner(PidTunerBuddy):
                 f"color:{clr};font-size:19pt;font-weight:700;"
                 f"background:transparent;border:none;"
                 f"font-family:Consolas,'Courier New';"
-                f"font-variant-numeric:tabular-nums;")
+                f"")
             unit = QLabel("Pa")
             unit.setStyleSheet(
                 f"color:{self._LBL2};font-size:10pt;font-weight:600;"
@@ -348,7 +348,7 @@ class VfdPressureTuner(PidTunerBuddy):
                 f"color:{color};font-size:22pt;font-weight:700;"
                 "background:transparent;border:none;"
                 "font-family:Consolas,'Courier New';"
-                "font-variant-numeric:tabular-nums;")
+                "")
             utag = QLabel(unit)
             utag.setStyleSheet(
                 f"color:{color};font-size:13pt;font-weight:700;"

@@ -144,7 +144,7 @@ class _MauSchematic(QWidget):
         """Return (center_x, box_bottom_y) for each of the 7 stage boxes in widget coords."""
         W, H = self.width(), self.height()
         n = 7; mg = 10; GAP = 22
-        LBL_H = 30; STRIP_H = 108; STAT_H = 26
+        LBL_H = 30; STRIP_H = 85; STAT_H = 26; PIPE_H = 85
         avail_bw = W - 2*mg - (n-1)*GAP
         bw = max(60, avail_bw // n)
         box_bot = H - STRIP_H - STAT_H - 2
@@ -154,10 +154,10 @@ class _MauSchematic(QWidget):
         """Return 6 (cx, cy) in widget coords for ISA circles — one per faceplate (fp[0..5])."""
         W, H = self.width(), self.height()
         n = 7; mg = 10; GAP = 22
-        LBL_H = 30; STRIP_H = 108; STAT_H = 26
+        LBL_H = 30; STRIP_H = 85; STAT_H = 26; PIPE_H = 85
         avail_bw = W - 2*mg - (n-1)*GAP
         bw = max(60, avail_bw // n)
-        box_top = mg + LBL_H + 2
+        box_top = mg + PIPE_H + LBL_H + 2
         box_bot = H - STRIP_H - STAT_H - 2
         bh = max(80, box_bot - box_top)
         r_s = 9
@@ -193,23 +193,147 @@ class _MauSchematic(QWidget):
         p.fillRect(0, 0, W, H, QColor("#060A1A"))
 
         n = 7; mg = 10; GAP = 22
-        LBL_H = 30; STRIP_H = 108; STAT_H = 26
+        LBL_H = 30; STRIP_H = 85; STAT_H = 26; PIPE_H = 85
         avail_bw = W - 2*mg - (n-1)*GAP
         bw = max(60, avail_bw // n)
-        box_top = mg + LBL_H + 2
+        box_top = mg + PIPE_H + LBL_H + 2
         box_bot = H - STRIP_H - STAT_H - 2
-        bh = max(80, box_bot - box_top)
+        bh = max(60, box_bot - box_top)
+        lbl_y = mg + PIPE_H  # stage label rect top
 
-        # Stage label rectangles
+        # Stage center X array (used for pipe routing)
+        scx = [mg + i*(bw+GAP) + bw//2 for i in range(n)]
+
+        # ── WATER PIPE NETWORK ──────────────────────────────────────────
+        v_r    = 18
+        val_cy = lbl_y - v_r - 5   # return valve Y center
+
+        HW_CLR  = QColor("#FF4444"); HW_RET = QColor("#CC2222")
+        CHW_CLR = QColor("#2299FF"); CHW_RET= QColor("#1166CC")
+        WSH_CLR = QColor("#00CC88")
+
+        stub_top = mg + 3           # pipes start near top of PIPE_H zone
+        dx = v_r + 10               # horizontal offset: supply left, return right
+        PIPE_W   = 12               # pipe stroke width
+
+        mv = self._mvs              # [HTC1, CC1, WSH, CC2, HTC2, FAN]
+
+        p.setFont(QFont("Consolas", 6, QFont.Weight.Bold))
+        fm6 = p.fontMetrics()
+        lbl_off = stub_top + fm6.height() + 1
+
+        def _flow_arrows(px, y1, y2, _clr, mv_pct, going_down: bool):
+            """Solid filled triangle arrows flowing inside a thick pipe — slow speed."""
+            if mv_pct < 1.0 or y2 - y1 < 16:
+                return
+            spacing = 36
+            raw_off = int(self._angle * 0.12) % spacing  # slow scroll
+            offset  = raw_off if going_down else (spacing - raw_off) % spacing
+            aw = PIPE_W // 2 - 2    # arrow half-width fits inside pipe
+            ah = aw + 3             # arrow height
+            alpha = min(230, 100 + int(mv_pct * 1.3))
+            arr_clr = QColor(255, 255, 255, alpha)
+            p.save()
+            p.setClipRect(QRect(px - PIPE_W // 2, y1, PIPE_W, y2 - y1))
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(arr_clr)
+            pos = y1 + offset
+            while pos < y2:
+                if going_down:
+                    pts = [QPoint(px, pos),
+                           QPoint(px - aw, pos - ah),
+                           QPoint(px + aw, pos - ah)]
+                else:
+                    pts = [QPoint(px, pos),
+                           QPoint(px - aw, pos + ah),
+                           QPoint(px + aw, pos + ah)]
+                p.drawPolygon(pts)
+                pos += spacing
+            p.restore()
+
+        def _ret_valve(rx, ry, clr, mv_pct):
+            """Animated return valve: bottom-fill + pulse glow (no spinning tick)."""
+            p.setPen(QPen(clr, 2.0)); p.setBrush(QColor("#040C18"))
+            p.drawEllipse(rx-v_r, ry-v_r, 2*v_r, 2*v_r)
+            fill_h = max(1, int((2*v_r - 2) * mv_pct / 100.0))
+            p.save()
+            p.setClipRect(QRect(rx-v_r+1, ry+v_r-1-fill_h, 2*v_r-2, fill_h))
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QColor(clr.red(), clr.green(), clr.blue(), 170))
+            p.drawEllipse(rx-v_r+1, ry-v_r+1, 2*v_r-2, 2*v_r-2)
+            p.restore()
+            pulse = abs(math.sin(math.radians(self._angle * 4)))
+            p.setPen(QPen(QColor(clr.red(), clr.green(), clr.blue(), int(110 * pulse)), 2.5))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawEllipse(rx-v_r-3, ry-v_r-3, 2*v_r+6, 2*v_r+6)
+            p.setFont(QFont("Consolas", 8, QFont.Weight.Bold))
+            p.setPen(QPen(QColor("#FFFFFF")))
+            p.drawText(QRect(rx-v_r, ry-v_r, 2*v_r, 2*v_r),
+                       Qt.AlignmentFlag.AlignCenter, f"{mv_pct:.0f}%")
+
+        def _coil_pipes(vx, sup_clr, ret_clr, sup_lbl, ret_lbl, mv_pct):
+            sx = vx - dx   # supply pipe x
+            rx = vx + dx   # return pipe x
+            # Supply: thick pipe straight down, no valve
+            p.setPen(QPen(sup_clr, PIPE_W, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+            p.drawLine(sx, stub_top, sx, lbl_y)
+            _flow_arrows(sx, stub_top, lbl_y, sup_clr, mv_pct, going_down=True)
+            # Return: thick pipe interrupted by valve
+            p.setPen(QPen(ret_clr, PIPE_W, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+            p.drawLine(rx, stub_top, rx, val_cy - v_r)
+            p.drawLine(rx, val_cy + v_r, rx, lbl_y)
+            _flow_arrows(rx, stub_top, val_cy - v_r, ret_clr, mv_pct, going_down=False)
+            _flow_arrows(rx, val_cy + v_r, lbl_y,    ret_clr, mv_pct, going_down=False)
+            # Labels — large enough to read, dark background patch
+            p.setFont(QFont("Consolas", 8, QFont.Weight.Bold))
+            fm8 = p.fontMetrics()
+            for lx_center, lbl_txt, lbl_clr in [
+                    (sx, sup_lbl, sup_clr), (rx, ret_lbl, ret_clr)]:
+                tw = fm8.horizontalAdvance(lbl_txt)
+                th = fm8.height()
+                bx = lx_center - tw // 2 - 2
+                by = lbl_off - th
+                p.setPen(Qt.PenStyle.NoPen)
+                p.setBrush(QColor(0, 0, 0, 160))
+                p.drawRect(bx, by, tw + 4, th + 1)
+                p.setPen(QPen(lbl_clr))
+                p.setBrush(Qt.BrushStyle.NoBrush)
+                p.drawText(lx_center - tw // 2, lbl_off, lbl_txt)
+            _ret_valve(rx, val_cy, ret_clr, mv_pct)
+
+        # ── per-stage pipes ───────────────────────────────────────────
+        _coil_pipes(scx[1], HW_CLR,  HW_RET,  "HWS", "HWR", mv[0] if mv else 0)
+        _coil_pipes(scx[2], CHW_CLR, CHW_RET, "CWS", "CWR", mv[1] if mv else 0)
+
+        # Washer: single supply pipe with animated valve
+        p.setPen(QPen(WSH_CLR, PIPE_W, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+        p.drawLine(scx[3], stub_top, scx[3], val_cy - v_r)
+        p.drawLine(scx[3], val_cy + v_r, scx[3], lbl_y)
+        _flow_arrows(scx[3], stub_top, val_cy - v_r, WSH_CLR, mv[2] if mv else 0, going_down=True)
+        _flow_arrows(scx[3], val_cy + v_r, lbl_y,    WSH_CLR, mv[2] if mv else 0, going_down=True)
+        p.setFont(QFont("Consolas", 8, QFont.Weight.Bold))
+        fm8w = p.fontMetrics()
+        tw_ws = fm8w.horizontalAdvance("WS")
+        th_ws = fm8w.height()
+        p.setPen(Qt.PenStyle.NoPen); p.setBrush(QColor(0, 0, 0, 160))
+        p.drawRect(scx[3] - tw_ws//2 - 2, lbl_off - th_ws, tw_ws + 4, th_ws + 1)
+        p.setPen(QPen(WSH_CLR)); p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawText(scx[3] - tw_ws//2, lbl_off, "WS")
+        _ret_valve(scx[3], val_cy, WSH_CLR, mv[2] if mv else 0)
+
+        _coil_pipes(scx[4], CHW_CLR, CHW_RET, "CWS", "CWR", mv[3] if mv else 0)
+        _coil_pipes(scx[5], HW_CLR,  HW_RET,  "HWS", "HWR", mv[4] if mv else 0)
+
+        # ── STAGE LABEL RECTANGLES ───────────────────────────────────────
         stage_lbls = ["OA INLET","HTC-1","CC-1","WASHER","CC-2","HTC-2","SUPPLY FAN"]
         for i in range(n):
             x = mg + i*(bw+GAP)
             p.setPen(QPen(QColor("#263850"), 1))
             p.setBrush(QColor("#0C1826"))
-            p.drawRoundedRect(x, mg, bw, LBL_H-2, 3, 3)
+            p.drawRoundedRect(x, lbl_y, bw, LBL_H-2, 3, 3)
             p.setPen(QPen(QColor("#B8C8D8")))
             p.setFont(QFont("Consolas", 8, QFont.Weight.Bold))
-            p.drawText(QRect(x, mg, bw, LBL_H-2), Qt.AlignmentFlag.AlignCenter, stage_lbls[i])
+            p.drawText(QRect(x, lbl_y, bw, LBL_H-2), Qt.AlignmentFlag.AlignCenter, stage_lbls[i])
 
         # Stage boxes + graphics + MV bar
         MV_BW = 8   # MV indicator bar width
@@ -242,31 +366,6 @@ class _MauSchematic(QWidget):
                 p.setPen(QPen(QColor(acc.red(), acc.green(), acc.blue(), 200)))
                 p.drawText(QRect(bx_mv-8, track_y+track_h+1, MV_BW+16, 10),
                            Qt.AlignmentFlag.AlignCenter, f"{mv_i:.0f}%")
-
-        # ISA instrument circles — 6 instruments for fp[0..5]
-        # fp[0..3]: outlet gaps 2-5; fp[4] HTC-2 T, fp[5] Fan P at far right
-        pv_types_list  = ["T", "T", "RH", "DP", "T", "P"]
-        pv_colors_list = ["#FF6B35", "#00D4FF", "#00FF9F", "#2E86FF", "#FFB300", "#BB77FF"]
-        r_s = 9
-        isa_pts_draw = self.isa_instrument_positions()
-
-        def _draw_isa(px, py, clr, label, stem_to=None):
-            c = QColor(clr)
-            if stem_to is not None:
-                p.setPen(QPen(c, 1.0, Qt.PenStyle.DashLine))
-                p.drawLine(px, py + r_s, px, stem_to)
-            p.setPen(QPen(c, 1.5)); p.setBrush(QColor("#050D1A"))
-            p.drawEllipse(px-r_s, py-r_s, 2*r_s, 2*r_s)
-            p.setPen(QPen(c, 0.9))
-            p.drawLine(px-r_s+2, py, px+r_s-2, py)
-            p.drawLine(px, py-r_s+2, px, py+r_s-2)
-            p.setFont(QFont("Consolas", 6, QFont.Weight.Bold)); p.setPen(QPen(c))
-            p.drawText(QRect(px-r_s, py-r_s, 2*r_s, 2*r_s),
-                       Qt.AlignmentFlag.AlignCenter, label)
-
-        for fi, ((ix, iy), pv_t, pv_c) in enumerate(
-                zip(isa_pts_draw, pv_types_list, pv_colors_list)):
-            _draw_isa(ix, iy, pv_c, pv_t)
 
         # Data strip
         strip_y = H - STRIP_H - STAT_H
@@ -323,145 +422,264 @@ class _MauSchematic(QWidget):
             p.setPen(QPen(QColor(clr))); p.drawText(cx2, ty, txt)
             cx2 += fm.horizontalAdvance(txt)
 
-        # Company watermark — on top, auto-sized to span full width
+        # Company watermark — in status bar at bottom, small size
         wm_txt = "亞聖國際科技有限公司"
-        for fs in range(60, 10, -2):
-            p.setFont(QFont("Microsoft JhengHei", fs, QFont.Weight.Bold))
-            if p.fontMetrics().horizontalAdvance(wm_txt) <= W - 20:
-                break
+        p.setFont(QFont("Microsoft JhengHei", 9, QFont.Weight.Bold))
         fm_wm = p.fontMetrics()
         wm_x = (W - fm_wm.horizontalAdvance(wm_txt)) // 2
-        wm_cy = (box_top + box_bot) // 2
-        p.setPen(QPen(QColor(0, 180, 220, 42)))
-        p.drawText(wm_x, wm_cy + fm_wm.ascent() // 2, wm_txt)
+        wm_y = H - STAT_H // 2 + fm_wm.ascent() // 2 - 2
+        p.setPen(QPen(QColor(0, 180, 220, 55)))
+        p.drawText(wm_x, wm_y, wm_txt)
         p.end()
 
     def _draw_unit(self, p, idx, x, y, w, h, mv):
-        cx = x+w//2; cy = y+h//2
+        cx = x + w // 2; cy = y + h // 2
+        pad = 8  # uniform inner padding for all boxes
 
-        if idx == 0:  # OA INLET — chevron grid (like air louvres)
-            rows = 6; cols = 2
-            rh2 = (h-16)//rows; cw2 = (w-12)//cols
+        def _draw_coil(bx, by, bw2, bh2, tube_clr, n_tubes=6):
+            """Serpentine heat-exchanger coil: horizontal tubes + alternating U-bends."""
+            marg = 8
+            x1, x2 = bx + marg, bx + bw2 - marg
+            avail_h = bh2 - 2 * marg
+            t_gap = max(6, avail_h // max(1, n_tubes - 1))
+            br = max(3, min(t_gap // 2, 8))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.setPen(QPen(tube_clr, 2.2, Qt.PenStyle.SolidLine,
+                          Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
+            for ti in range(n_tubes):
+                ty = by + marg + ti * t_gap
+                p.drawLine(x1, ty, x2, ty)
+                if ti < n_tubes - 1:
+                    if ti % 2 == 0:
+                        p.drawArc(QRect(x2 - br, ty, 2*br, t_gap), 90*16, -180*16)
+                    else:
+                        p.drawArc(QRect(x1 - br, ty, 2*br, t_gap), 90*16, 180*16)
+
+        def _draw_airflow(bx, by, bw2, bh2):
+            """Floating particle airflow: small dots drifting L→R like washer spray."""
+            fan_mv = (self._mvs[5] if self._mvs else 0)
+            if fan_mv < 2:
+                return
+            n_lanes    = max(3, int(2 + fan_mv / 22))   # 3–7 horizontal lanes
+            n_per_lane = max(2, int(fan_mv / 18))        # 2–6 particles per lane
+            speed      = 0.12 + fan_mv * 0.008
+            alpha_base = min(155, int(fan_mv * 1.55))
+            spacing    = bw2 // max(1, n_per_lane)
+
+            p.save()
+            p.setClipRect(bx, by, bw2, bh2)
+            p.setPen(Qt.PenStyle.NoPen)
+
+            for lane in range(n_lanes):
+                lane_y  = by + int(bh2 * (lane + 0.5) / n_lanes)
+                spd_v   = speed * (0.82 + (lane % 3) * 0.12)
+
+                for pi in range(n_per_lane + 2):
+                    raw_x = int(self._angle * spd_v
+                                + pi * spacing
+                                + lane * (spacing // 3)) % bw2
+                    px_x = bx + raw_x
+                    # slight vertical wobble
+                    ry = lane_y + int(
+                        math.sin(math.radians(pi * 73 + lane * 51)) * 4)
+                    sz = 3 if pi % 2 == 0 else 2
+                    a  = int(alpha_base * (
+                        0.45 + 0.55 * abs(math.sin(
+                            math.radians(pi * 97 + lane * 43)))))
+                    a  = max(35, min(alpha_base, a))
+                    p.setBrush(QColor(200, 235, 255, a))
+                    p.drawEllipse(px_x - sz // 2, ry - sz // 2, sz, sz)
+
+            p.restore()
+
+        if idx == 0:  # OA INLET — chevron arrows (airflow left→right)
+            rows = 6
+            rh = (h - 2*pad) // rows
             for r in range(rows):
-                ry = y+8+r*rh2+rh2//2
-                for c in range(cols):
-                    bx2 = x+6+c*cw2
-                    p.setPen(QPen(QColor("#2A4060"), 1.2))
-                    p.drawLine(bx2, ry, bx2+cw2//2-8, ry)
-                    tip = bx2+cw2//2-2
+                ry = y + pad + r * rh + rh // 2
+                for col_off in (-w//4, w//4):
+                    tip = cx + col_off + 10
                     p.setPen(QPen(QColor("#3A5878"), 1.8, Qt.PenStyle.SolidLine,
                                   Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
-                    p.drawLine(tip-7, ry-5, tip, ry); p.drawLine(tip, ry, tip-7, ry+5)
+                    p.drawLine(tip-10, ry-6, tip, ry)
+                    p.drawLine(tip,    ry,   tip-10, ry+6)
 
-        elif idx in (1, 5):  # HTC — narrow gradient bar + "+" circle
-            bar_w = max(16, w//3); bx2 = cx-bar_w//2
-            by2 = y+14; bh2 = h-28
-            grad = QLinearGradient(bx2, by2, bx2, by2+bh2)
-            if idx == 1:  # red
-                grad.setColorAt(0.0, QColor("#1A0300")); grad.setColorAt(0.35, QColor("#991A00"))
-                grad.setColorAt(0.5, QColor("#CC3300")); grad.setColorAt(0.65, QColor("#991A00"))
-                grad.setColorAt(1.0, QColor("#1A0300"))
-            else:  # amber
-                grad.setColorAt(0.0, QColor("#1A0E00")); grad.setColorAt(0.35, QColor("#885500"))
-                grad.setColorAt(0.5, QColor("#BB7700")); grad.setColorAt(0.65, QColor("#885500"))
-                grad.setColorAt(1.0, QColor("#1A0E00"))
+        elif idx in (1, 5):  # HTC-1 / HTC-2 — wide coil + ⊕ circle
+            bx = x + pad; by = y + pad
+            bw2 = w - 2*pad; bh2 = h - 2*pad
+
+            if idx == 1:
+                c0, c1, c2 = "#140200", "#8B1800", "#CC2800"
+                circ_clr = QColor("#FF3300")
+            else:
+                c0, c1, c2 = "#140200", "#8B1800", "#CC2800"
+                circ_clr = QColor("#FF3300")
+
+            grad = QLinearGradient(cx, by, cx, by + bh2)
+            grad.setColorAt(0.0, QColor(c0)); grad.setColorAt(0.3, QColor(c1))
+            grad.setColorAt(0.5, QColor(c2)); grad.setColorAt(0.7, QColor(c1))
+            grad.setColorAt(1.0, QColor(c0))
             p.setPen(Qt.PenStyle.NoPen); p.setBrush(QBrush(grad))
-            p.drawRoundedRect(bx2, by2, bar_w, bh2, 3, 3)
-            p.setPen(QPen(QColor(255,255,255,20), 0.8))
-            for fi in range(bh2//7):
-                p.drawLine(bx2+2, by2+fi*7+3, bx2+bar_w-2, by2+fi*7+3)
-            rv = min(18, w//3, h//5)
-            circ = QColor("#FF3300") if idx==1 else QColor("#FF9900")
-            p.setPen(Qt.PenStyle.NoPen); p.setBrush(circ)
-            p.drawEllipse(cx-rv, cy-rv, 2*rv, 2*rv)
-            p.setPen(QPen(QColor("#FFFFFF"), 2.5))
-            p.drawLine(cx-rv+5, cy, cx+rv-5, cy); p.drawLine(cx, cy-rv+5, cx, cy+rv-5)
+            p.drawRoundedRect(bx, by, bw2, bh2, 4, 4)
 
-        elif idx == 2:  # CC-1 — vertical gradient fins + "−" circle
-            nf = max(2, (w-12)//12); fw = max(3, (w-12)//(nf+1))
+            # Fin lines (thin horizontal)
+            n_fins = max(8, bh2 // 6)
+            p.setPen(QPen(QColor(255, 255, 255, 18), 0.6))
+            for fi in range(n_fins):
+                fy = by + 3 + fi * ((bh2 - 6) // n_fins)
+                p.drawLine(bx + 4, fy, bx + bw2 - 4, fy)
+
+            # Serpentine coil tubes
+            tube_clr = QColor(255, 150, 70, 170)
+            _draw_coil(bx, by, bw2, bh2, tube_clr)
+
+            rv = min(22, w // 4, h // 5)
+            p.setPen(Qt.PenStyle.NoPen); p.setBrush(circ_clr)
+            p.drawEllipse(cx - rv, cy - rv, 2*rv, 2*rv)
+            p.setPen(QPen(QColor("#FFFFFF"), 2.5))
+            p.drawLine(cx - rv + 5, cy, cx + rv - 5, cy)
+            p.drawLine(cx, cy - rv + 5, cx, cy + rv - 5)
+
+        elif idx in (2, 4):  # CC-1 / CC-2 — identical blue cooling coil + ⊖ circle
+            bx = x + pad; by = y + pad
+            bw2 = w - 2*pad; bh2 = h - 2*pad
+            cv = int(60 + 120 * (mv / 100.0))
+
+            # Same blue gradient for both CC-1 and CC-2
+            grad = QLinearGradient(cx, by, cx, by + bh2)
+            grad.setColorAt(0.0, QColor(0, 8, 40))
+            grad.setColorAt(0.3, QColor(0, cv // 2, 150))
+            grad.setColorAt(0.5, QColor(0, cv, 210))
+            grad.setColorAt(0.7, QColor(0, cv // 2, 150))
+            grad.setColorAt(1.0, QColor(0, 8, 40))
+            p.setPen(Qt.PenStyle.NoPen); p.setBrush(QBrush(grad))
+            p.drawRoundedRect(bx, by, bw2, bh2, 4, 4)
+
+            # Fin lines
+            n_fins = max(8, bh2 // 6)
+            p.setPen(QPen(QColor(255, 255, 255, 18), 0.6))
+            for fi in range(n_fins):
+                fy = by + 3 + fi * ((bh2 - 6) // n_fins)
+                p.drawLine(bx + 4, fy, bx + bw2 - 4, fy)
+
+            # Serpentine coil tubes
+            _draw_coil(bx, by, bw2, bh2, QColor(60, 190, 255, 175))
+
+            rv = min(22, w // 4, h // 5)
+            p.setPen(Qt.PenStyle.NoPen); p.setBrush(QColor(0, int(80 + 140*(mv/100.0)), 220))
+            p.drawEllipse(cx - rv, cy - rv, 2*rv, 2*rv)
+            p.setPen(QPen(QColor("#FFFFFF"), 2.5))
+            p.drawLine(cx - rv + 5, cy, cx + rv - 5, cy)  # minus sign only
+
+        elif idx == 3:  # WASHER — animated spray nozzles
+            bx = x + pad; by = y + pad
+            bw2 = w - 2*pad; bh2 = h - 2*pad
+
+            # Background panel
+            p.setPen(QPen(QColor("#3A4A5A"), 1.5)); p.setBrush(QColor("#0D1A28"))
+            p.drawRoundedRect(bx, by, bw2, bh2, 4, 4)
+            p.setPen(Qt.PenStyle.NoPen); p.setBrush(QColor("#080F1A"))
+            p.drawRoundedRect(bx+4, by+4, bw2-8, bh2-8, 2, 2)
+
+            # Nozzle pipe bar at top
+            nz_bar_y = by + 10
+            p.setPen(QPen(QColor("#4A8ABB"), 1.5)); p.setBrush(QColor("#1E4A6A"))
+            p.drawRoundedRect(bx + 6, nz_bar_y - 4, bw2 - 12, 8, 2, 2)
+
+            # 3 nozzle positions
+            n_nz = 3
+            nz_xs = [bx + (i+1) * bw2 // (n_nz+1) for i in range(n_nz)]
             p.setPen(Qt.PenStyle.NoPen)
-            for fi in range(nf):
-                fx = x+6+fi*(fw+4)
-                gf = QLinearGradient(fx, y+10, fx, y+h-10)
-                cv = int(50+140*(mv/100.0))
-                gf.setColorAt(0, QColor(0,15,70)); gf.setColorAt(0.5, QColor(0,cv,210))
-                gf.setColorAt(1, QColor(0,15,70))
-                p.setBrush(QBrush(gf)); p.drawRoundedRect(fx, y+10, fw, h-20, 1, 1)
-            rv = min(18, w//3, h//5); cv2 = int(80+140*(mv/100.0))
-            p.setPen(Qt.PenStyle.NoPen); p.setBrush(QColor(0, cv2, 220))
-            p.drawEllipse(cx-rv, cy-rv, 2*rv, 2*rv)
-            p.setPen(QPen(QColor("#FFFFFF"), 2.5))
-            p.drawLine(cx-rv+5, cy, cx+rv-5, cy)
+            for nz_x in nz_xs:
+                p.setBrush(QColor("#70CCFF"))
+                p.drawEllipse(nz_x - 4, nz_bar_y - 4, 8, 8)
 
-        elif idx == 3:  # WASHER — gray body + nozzles + level line
-            bdy_w = max(20, w*6//10); bdy_h = h-20
-            bx2 = cx-bdy_w//2; bdy_y = y+10
-            p.setPen(QPen(QColor("#3A4A5A"), 1.5)); p.setBrush(QColor("#131D2A"))
-            p.drawRoundedRect(bx2, bdy_y, bdy_w, bdy_h, 4, 4)
-            p.setPen(Qt.PenStyle.NoPen); p.setBrush(QColor("#1B2738"))
-            p.drawRoundedRect(bx2+4, bdy_y+4, bdy_w-8, bdy_h-8, 2, 2)
-            lv_y = bdy_y + bdy_h//2
-            p.setPen(QPen(QColor("#B0C0D0"), 1.5))
-            p.drawLine(bx2+6, lv_y, bx2+bdy_w-6, lv_y)
-            alpha = min(255, int(50+200*(mv/100.0)))
-            p.setPen(Qt.PenStyle.NoPen); p.setBrush(QColor(70,140,210,alpha))
-            for ni in range(3):
-                nz_x = bx2+bdy_w//4+ni*(bdy_w//4)
-                p.drawEllipse(nz_x-3, bdy_y+8-3, 6, 6)
-            p.setPen(QPen(QColor(70,150,220,alpha), 0.8))
-            for ni in range(3):
-                nz_x = bx2+bdy_w//4+ni*(bdy_w//4)
-                for j in range(3):
-                    p.drawLine(nz_x, bdy_y+14, nz_x+(j-1)*4, bdy_y+14+j*16)
+            # Animated spray streams (fan of drops from each nozzle)
+            spray_top = nz_bar_y + 5
+            spray_bot = by + bh2 - 8
+            spray_h   = max(1, spray_bot - spray_top)
+            max_reach = max(4, int(spray_h * mv / 100.0))
+            spray_a   = min(230, int(mv * 2.3))
 
-        elif idx == 4:  # CC-2 — diagonal cross-hatch blue + "−" circle
-            p.save(); p.setClipRect(x+2, y+2, w-4, h-4)
-            step = 14
-            for off in range(-h, w+h, step):
-                pg = QLinearGradient(x+off, y, x+off+h, y+h)
-                pg.setColorAt(0, QColor(0,50,140,150)); pg.setColorAt(1, QColor(0,90,190,90))
-                p.setPen(QPen(QBrush(pg), 2.0))
-                p.drawLine(x+off, y, x+off+h, y+h)
-                p.drawLine(x+off+h, y, x+off, y+h)
-            p.restore()
-            rv = min(18, w//3, h//5); cv3 = int(80+140*(mv/100.0))
-            p.setPen(Qt.PenStyle.NoPen); p.setBrush(QColor(0, cv3, 220))
-            p.drawEllipse(cx-rv, cy-rv, 2*rv, 2*rv)
-            p.setPen(QPen(QColor("#FFFFFF"), 2.5))
-            p.drawLine(cx-rv+5, cy, cx+rv-5, cy)
+            if mv > 1:
+                angles_deg = [-14, -7, 0, 7, 14]
+                p.save()
+                p.setClipRect(bx + 2, spray_top, bw2 - 4, spray_h)
+                for ni, nz_x in enumerate(nz_xs):
+                    for ai, adeg in enumerate(angles_deg):
+                        arad  = math.radians(adeg)
+                        dxs   = math.sin(arad)
+                        dys   = math.cos(arad)
+                        phase = (ni * 37 + ai * 13) % 20
+                        spd   = 1.8 + mv * 0.025
+                        t_off = int(self._angle * spd + phase) % 20
+                        gap   = 18
+                        pos   = float(t_off)
+                        while pos < max_reach:
+                            fade   = 1.0 - pos / max_reach
+                            a      = int(spray_a * (0.25 + 0.75 * fade))
+                            sz     = max(2, int(3.5 * fade + 0.5))
+                            drop_x = int(nz_x + pos * dxs) - sz // 2
+                            drop_y = int(spray_top + pos * dys) - sz // 2
+                            p.setBrush(QColor(80, 165, 245, a))
+                            p.drawEllipse(drop_x, drop_y, sz, sz)
+                            pos += gap
+                p.restore()
 
-        elif idx == 6:  # Supply Fan — large circle + single blade + motor + chevrons
-            fan_w = w*6//10; fan_cx = x+fan_w//2; fan_cy = cy
-            rf = min(fan_w//2-4, h//2-8)
-            p.setPen(QPen(QColor("#3A5A7A"), 1.8)); p.setBrush(QColor("#081018"))
-            p.drawEllipse(fan_cx-rf, fan_cy-rf, 2*rf, 2*rf)
+            # Water pool at bottom (height ∝ MV)
+            pool_h = max(3, int((spray_h * 0.22) * mv / 100.0))
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QColor(30, 90, 170, 180))
+            p.drawRoundedRect(bx + 4, spray_bot - pool_h, bw2 - 8, pool_h, 2, 2)
+            # ripple lines on pool surface
+            if mv > 5:
+                rip_y = spray_bot - pool_h
+                rip_phase = int(self._angle * 2) % 8
+                p.setPen(QPen(QColor(100, 180, 255, 80), 1.0))
+                for ri in range(2):
+                    ry = rip_y + rip_phase + ri * 4
+                    if spray_bot - 2 > ry > spray_bot - pool_h:
+                        p.drawLine(bx + 8, ry, bx + bw2 - 8, ry)
+
+        elif idx == 6:  # SUPPLY FAN — large cyan circle + rotating blade
+            rf = min(w, h) // 2 - 10
+            fan_cx = cx; fan_cy = cy
+
+            # Outer circle
+            p.setPen(QPen(QColor("#00B4D8"), 2.5)); p.setBrush(QColor("#040C18"))
+            p.drawEllipse(fan_cx - rf, fan_cy - rf, 2*rf, 2*rf)
+
+            # Rotating blade
             ang = math.radians(self._angle)
-            bx0 = fan_cx+int(rf*0.85*math.cos(ang+math.pi))
-            by0 = fan_cy+int(rf*0.85*math.sin(ang+math.pi))
-            bx1 = fan_cx+int(rf*0.85*math.cos(ang))
-            by1 = fan_cy+int(rf*0.85*math.sin(ang))
-            p.setPen(QPen(QColor("#5A8AB0"), 2.5)); p.drawLine(bx0, by0, bx1, by1)
-            p.setPen(Qt.PenStyle.NoPen); p.setBrush(QColor("#7AAAD0"))
-            p.drawEllipse(fan_cx-4, fan_cy-4, 8, 8)
-            mh_w = max(14, fan_w//3); mh_h = max(10, rf//3)
-            mh_x = fan_cx+rf//2; mh_y = fan_cy+rf//2
-            p.setPen(QPen(QColor("#385068"), 1.2)); p.setBrush(QColor("#0E1A2C"))
+            bx0 = fan_cx + int(rf * 0.82 * math.cos(ang + math.pi))
+            by0 = fan_cy + int(rf * 0.82 * math.sin(ang + math.pi))
+            bx1 = fan_cx + int(rf * 0.82 * math.cos(ang))
+            by1 = fan_cy + int(rf * 0.82 * math.sin(ang))
+            p.setPen(QPen(QColor("#8ACCE0"), 3.0)); p.drawLine(bx0, by0, bx1, by1)
+
+            # Hub
+            p.setPen(Qt.PenStyle.NoPen); p.setBrush(QColor("#60AAC8"))
+            p.drawEllipse(fan_cx - 5, fan_cy - 5, 10, 10)
+
+            # Motor housing (bottom center of circle)
+            mh_w = max(30, rf // 2); mh_h = max(16, rf // 4)
+            mh_x = fan_cx - mh_w // 2; mh_y = fan_cy + rf - mh_h + 2
+            p.setPen(QPen(QColor("#2A4A5A"), 1.2)); p.setBrush(QColor("#0A1828"))
             p.drawRect(mh_x, mh_y, mh_w, mh_h)
-            p.setFont(QFont("Microsoft JhengHei", 7)); p.setPen(QPen(QColor("#5A7A9A")))
-            p.drawText(QRect(mh_x, mh_y-14, mh_w, 14), Qt.AlignmentFlag.AlignCenter, "馬達")
+            p.setFont(QFont("Microsoft JhengHei", 7)); p.setPen(QPen(QColor("#4A7A9A")))
+            p.drawText(QRect(mh_x, mh_y, mh_w, mh_h), Qt.AlignmentFlag.AlignCenter, "馬達")
+
+            # Triangular indicators at box bottom
             p.setPen(Qt.PenStyle.NoPen); p.setBrush(QColor("#CC9900"))
             for ti in range(2):
-                tx = fan_cx-rf//2+ti*rf
-                p.drawPolygon(QPolygonF([QPointF(float(tx-8),float(y+h-2)),
-                                         QPointF(float(tx+8),float(y+h-2)),
-                                         QPointF(float(tx),  float(y+h-10))]))
-            chev_x0 = x+fan_w+4; chev_w = w-fan_w-6
-            for r in range(5):
-                ry2 = y+8+r*((h-16)//5)+(h-16)//10
-                p.setPen(QPen(QColor("#2A4060"), 1.5, Qt.PenStyle.SolidLine,
-                              Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
-                tip2 = chev_x0+chev_w//2+4
-                p.drawLine(tip2-7, ry2-5, tip2, ry2); p.drawLine(tip2, ry2, tip2-7, ry2+5)
+                tx = fan_cx - rf // 3 + ti * (rf * 2 // 3)
+                p.drawPolygon(QPolygonF([QPointF(float(tx-7), float(y+h-3)),
+                                         QPointF(float(tx+7), float(y+h-3)),
+                                         QPointF(float(tx),   float(y+h-12))]))
+
+        # ── Airflow overlay: all stages including OA inlet and supply fan ──
+        if 0 <= idx <= 6:
+            _draw_airflow(x + pad, y + pad, w - 2*pad, h - 2*pad)
 
 
 # ═══════════════════════════════════════════════════════
@@ -987,11 +1205,11 @@ class MauSimulator(BaseToolWindow):
             PidCtrl(0.05, 0.03, 0.0, reverse=True),    # 5 Fan
         ]
         self._fo = [
-            FopdtCoil(0.3,  55.0, 5.0, heating=True),    # HTC1
-            FopdtCoil(0.3,  65.0, 6.0, heating=False),   # CC1
+            FopdtCoil(0.28, 55.0, 5.0, heating=True),    # HTC1  (HW=40°C → max ΔT≈30°C)
+            FopdtCoil(0.22, 65.0, 6.0, heating=False),   # CC1   (CHW=7°C → max ΔT≈13°C)
             FopdtCoil(3.0,  30.0, 3.0, heating=True),    # Washer (effectiveness lag)
-            FopdtCoil(0.3,  35.0, 4.0, heating=False),   # CC2
-            FopdtCoil(0.3,  45.0, 5.0, heating=True),    # HTC2
+            FopdtCoil(0.22, 35.0, 4.0, heating=False),   # CC2   (CHW=7°C → max ΔT≈10°C)
+            FopdtCoil(0.28, 45.0, 5.0, heating=True),    # HTC2  (HW=40°C → max ΔT≈30°C)
             FopdtCoil(40.0, 10.0, 1.0, heating=True),    # Fan (Pa response)
         ]
 
@@ -1128,7 +1346,9 @@ class MauSimulator(BaseToolWindow):
         f = QFrame(); f.setStyleSheet(f"QFrame{{background:{self._BG};border:none;}}")
         lay = QVBoxLayout(f); lay.setContentsMargins(0,0,0,0); lay.setSpacing(4)
         self._schematic = _MauSchematic(select_cb=self._on_schematic_click)
-        self._schematic.setMinimumHeight(220); lay.addWidget(self._schematic, 1)
+        self._schematic.setMinimumHeight(300)
+        self._schematic.setMaximumHeight(380)
+        lay.addWidget(self._schematic, 1)
         return f
 
     def _build_strip(self):
@@ -1159,18 +1379,18 @@ class MauSimulator(BaseToolWindow):
         h = QHBoxLayout(f); h.setContentsMargins(3, 3, 3, 3); h.setSpacing(5)
 
         defs = [
-            ("HTC-1\nPREHEAT",   self._pid[0], self._fo[0],  0.0,    45.0),
-            ("CC-1\nPRECOOL",    self._pid[1], self._fo[1],  0.0,    40.0),
+            ("HTC-1\nPREHEAT",   self._pid[0], self._fo[0],  0.0,    40.0),  # hi=HW 40°C
+            ("CC-1\nPRECOOL",    self._pid[1], self._fo[1],  7.0,    40.0),  # lo=CHW 7°C
             ("WASHER\nHUMIDIFY", self._pid[2], self._fo[2],  50.0,  100.0),
-            ("CC-2\nDEHUMID",    self._pid[3], self._fo[3],  7.0,    30.0),
-            ("HTC-2\nREHEAT",    self._pid[4], self._fo[4],  7.0,    40.0),
+            ("CC-2\nDEHUMID",    self._pid[3], self._fo[3],  7.0,    30.0),  # lo=CHW 7°C
+            ("HTC-2\nREHEAT",    self._pid[4], self._fo[4],  7.0,    40.0),  # hi=HW 40°C
             ("SUPPLY\nFAN",      self._pid[5], self._fo[5],  500.0, 4000.0),
         ]
         default_sps = [22.0, 24.0, 90.0, 10.0, 22.0, 2000.0]
         self._fp: list[_StageFaceplate] = []
         for idx, ((name, pid, fo, lo, hi), sp) in enumerate(zip(defs, default_sps)):
             i = idx
-            htc1_modes = [("T °C", 0.0, 45.0, 22.0), ("H kJ/kg", 0.0, 100.0, 40.0)] if idx == 0 else None
+            htc1_modes = [("T °C", 0.0, 40.0, 22.0), ("H kJ/kg", 0.0, 100.0, 40.0)] if idx == 0 else None
             fp = _StageFaceplate(name, pid, fo, lo, hi,
                                  select_cb=lambda i=i: self._set_selected(i),
                                  pv_modes=htc1_modes)
@@ -1586,13 +1806,45 @@ class MauSimulator(BaseToolWindow):
                             f"border:1px solid {self._BDR};border-radius:3px;"
                             f"font-size:11pt;font-weight:700;font-family:Consolas;}}"
                             f"QLineEdit:focus{{border:1px solid {self._ACC};}}"); return e
+        def _mk_spin(le: QLineEdit, step: float, lo: float, hi: float,
+                     is_pm: bool = False) -> QWidget:
+            """Wrap a QLineEdit with ▲ / ▼ buttons that step by `step`."""
+            cw = QWidget(); hl = QHBoxLayout(cw)
+            hl.setContentsMargins(0, 0, 0, 0); hl.setSpacing(2)
+            hl.addWidget(le)
+            vw = QWidget(); vl = QVBoxLayout(vw)
+            vl.setContentsMargins(0, 0, 0, 0); vl.setSpacing(1)
+            def _adj(delta):
+                txt = le.text().replace("±", "").strip()
+                try: cur = float(txt)
+                except: return
+                val = round(max(lo, min(hi, cur + delta)), 2)
+                le.setText(f"±{val:.1f}" if is_pm else f"{val:.1f}")
+                self._commit_targets()
+            for sym, d in [("▲", step), ("▼", -step)]:
+                b = QPushButton(sym); b.setFixedSize(20, 12)
+                b.setStyleSheet(
+                    "QPushButton{background:#0E1C2E;color:#7AAFDF;"
+                    "border:1px solid #1A3050;border-radius:2px;"
+                    "font-size:8px;padding:0;}"
+                    "QPushButton:hover{background:#1A3050;color:#AADDFF;}"
+                    "QPushButton:pressed{background:#2A5080;}")
+                b.clicked.connect(lambda _, d=d: _adj(d))
+                vl.addWidget(b)
+            hl.addWidget(vw)
+            return cw
+
         g.addWidget(hdr("TARGET ZONE CONFIG", self._ACC), 0, 0, 1, 4)
         g.addWidget(hdr("TEMP SETPOINT"), 1, 0)
         self._T_sp_in = vi("22","#FF6B6B"); self._T_tol_in = vi("±2","#FF9999")
-        g.addWidget(self._T_sp_in, 1, 1); g.addWidget(self._T_tol_in, 1, 2); g.addWidget(hdr("°C"), 1, 3)
+        g.addWidget(_mk_spin(self._T_sp_in,  0.1, -20.0, 50.0),          1, 1)
+        g.addWidget(_mk_spin(self._T_tol_in, 0.1,   0.1, 20.0, True),    1, 2)
+        g.addWidget(hdr("°C"), 1, 3)
         g.addWidget(hdr("RH SETPOINT"), 2, 0)
         self._RH_sp_in = vi("50","#00B4D8"); self._RH_tol_in = vi("±5","#55CCEE")
-        g.addWidget(self._RH_sp_in, 2, 1); g.addWidget(self._RH_tol_in, 2, 2); g.addWidget(hdr("%"), 2, 3)
+        g.addWidget(_mk_spin(self._RH_sp_in,  0.1,   0.0, 100.0),        2, 1)
+        g.addWidget(_mk_spin(self._RH_tol_in, 0.1,   0.1, 30.0,  True),  2, 2)
+        g.addWidget(hdr("%"), 2, 3)
         for e in (self._T_sp_in, self._T_tol_in, self._RH_sp_in, self._RH_tol_in):
             e.editingFinished.connect(self._commit_targets)
         self._cur_lbl = QLabel("—")
@@ -1685,11 +1937,13 @@ class MauSimulator(BaseToolWindow):
         # HTC-1: preheat (PV = T°C or enthalpy kJ/kg depending on user selection)
         pv_htc1 = self._states[1].h if self._fp[0].pv_mode_idx == 1 else self._states[1].T
         mv1 = self._pid[0].compute(pv_htc1, self._fp[0].sp, dt)
-        s[1] = AirState(T=oa.T + self._fo[0].step(mv1, dt, fan_sc), w=oa.w)
+        T1 = min(40.0, oa.T + self._fo[0].step(mv1, dt, fan_sc))  # clamp to HW=40°C
+        s[1] = AirState(T=T1, w=oa.w)
 
         # CC-1: precool, condensation check
         mv2 = self._pid[1].compute(self._states[2].T, self._fp[1].sp, dt)
-        T2 = s[1].T + self._fo[1].step(mv2, dt, fan_sc); w2 = s[1].w
+        T2 = max(7.0, s[1].T + self._fo[1].step(mv2, dt, fan_sc))  # clamp to CHW=7°C
+        w2 = s[1].w
         if T2 < Psych.t_dp(w2): w2 = max(0.0, Psych.omega_sat(T2))
         s[2] = AirState(T=T2, w=w2)
 
@@ -1704,13 +1958,15 @@ class MauSimulator(BaseToolWindow):
 
         # CC-2: dehumidify — PV = outlet dew point (取樣在出風口)
         mv4 = self._pid[3].compute(self._states[4].T_dp, self._fp[3].sp, dt)
-        T4 = max(2.0, s[3].T + self._fo[3].step(mv4, dt, fan_sc)); w4 = s[3].w
+        T4 = max(7.0, s[3].T + self._fo[3].step(mv4, dt, fan_sc))  # clamp to CHW=7°C
+        w4 = s[3].w
         if T4 < Psych.t_dp(s[3].w): w4 = max(0.0, Psych.omega_sat(T4))
         s[4] = AirState(T=T4, w=w4)
 
         # HTC-2: reheat
         mv5 = self._pid[4].compute(self._states[5].T, self._fp[4].sp, dt)
-        s[5] = AirState(T=s[4].T + self._fo[4].step(mv5, dt, fan_sc), w=s[4].w)
+        T5 = min(40.0, s[4].T + self._fo[4].step(mv5, dt, fan_sc))  # clamp to HW=40°C
+        s[5] = AirState(T=T5, w=s[4].w)
 
         s[6] = s[5].copy(); self._states = s
 

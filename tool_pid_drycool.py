@@ -444,7 +444,7 @@ class AhuDryCoolTuner(BaseToolWindow):
             val = QLabel("0.00")
             val.setStyleSheet(f"color:{clr};font-size:19pt;font-weight:700;"
                               f"background:transparent;border:none;"
-                              f"font-family:Consolas,'Courier New';font-variant-numeric:tabular-nums;")
+                              f"font-family:Consolas,'Courier New';")
             unt = QLabel(unit)
             unt.setStyleSheet(f"color:{self._LBL2};font-size:10pt;font-weight:600;"
                               f"background:transparent;border:none;"
@@ -519,7 +519,7 @@ class AhuDryCoolTuner(BaseToolWindow):
         self._mv_big.setStyleSheet(
             f"color:{self._RESULT};font-size:19pt;font-weight:700;"
             f"background:transparent;border:none;"
-            f"font-family:Consolas,'Courier New';font-variant-numeric:tabular-nums;")
+            f"font-family:Consolas,'Courier New';")
         mv_u = QLabel("%"); mv_u.setStyleSheet(
             f"color:{self._LBL2};font-size:10pt;font-weight:600;"
             f"background:transparent;border:none;"

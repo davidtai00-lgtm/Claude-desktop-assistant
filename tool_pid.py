@@ -303,7 +303,7 @@ class PidTunerBuddy(BaseToolWindow):
             val.setStyleSheet(f"color:{clr};font-size:19pt;font-weight:700;"
                               f"background:transparent;border:none;"
                               f"font-family:Consolas,'Courier New';"
-                              f"font-variant-numeric:tabular-nums;")
+                              f"")
             pct = QLabel("%")
             pct.setStyleSheet(f"color:{self._LBL2};font-size:10pt;font-weight:600;"
                               f"background:transparent;border:none;"
@@ -399,7 +399,7 @@ class PidTunerBuddy(BaseToolWindow):
             f"color:{self._RESULT};font-size:19pt;font-weight:700;"
             f"background:transparent;border:none;"
             f"font-family:Consolas,'Courier New';"
-            f"font-variant-numeric:tabular-nums;")
+            f"")
         mv_pct = QLabel("%")
         mv_pct.setStyleSheet(f"color:{self._LBL2};font-size:10pt;font-weight:600;"
                              f"background:transparent;border:none;"
