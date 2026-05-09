@@ -205,124 +205,104 @@ class _MauSchematic(QWidget):
         scx = [mg + i*(bw+GAP) + bw//2 for i in range(n)]
 
         # ── WATER PIPE NETWORK ──────────────────────────────────────────
-        v_r    = 18
-        val_cy = lbl_y - v_r - 5   # return valve Y center
+        V_R      = 18
+        PIPE_W   = 12
+        DX       = V_R + 10
+        STUB_TOP = mg + 3
+        VAL_CY   = lbl_y - V_R - 5
 
-        HW_CLR  = QColor("#FF4444"); HW_RET = QColor("#CC2222")
-        CHW_CLR = QColor("#2299FF"); CHW_RET= QColor("#1166CC")
-        WSH_CLR = QColor("#00CC88")
+        HW_S  = QColor("#FF4444"); HW_R  = QColor("#CC2222")
+        CHW_S = QColor("#2299FF"); CHW_R = QColor("#1166CC")
+        WSH_C = QColor("#00CC88")
 
-        stub_top = mg + 3           # pipes start near top of PIPE_H zone
-        dx = v_r + 10               # horizontal offset: supply left, return right
-        PIPE_W   = 12               # pipe stroke width
+        mvs = self._mvs if self._mvs else [0.0] * 6
 
-        mv = self._mvs              # [HTC1, CC1, WSH, CC2, HTC2, FAN]
+        p.setFont(QFont("Consolas", 8, QFont.Weight.Bold))
+        fm8    = p.fontMetrics()
+        lbl_off = STUB_TOP + fm8.height() + 1
 
-        p.setFont(QFont("Consolas", 6, QFont.Weight.Bold))
-        fm6 = p.fontMetrics()
-        lbl_off = stub_top + fm6.height() + 1
-
-        def _flow_arrows(px, y1, y2, _clr, mv_pct, going_down: bool):
-            """Solid filled triangle arrows flowing inside a thick pipe — slow speed."""
+        # ── nested helpers ────────────────────────────────────────────────
+        def _flow_arrows(px, y1, y2, mv_pct, going_down: bool):
+            """Filled triangle arrows scrolling inside a thick pipe."""
             if mv_pct < 1.0 or y2 - y1 < 16:
                 return
             spacing = 36
-            raw_off = int(self._angle * 0.12) % spacing  # slow scroll
+            raw_off = int(self._angle * 0.12) % spacing
             offset  = raw_off if going_down else (spacing - raw_off) % spacing
-            aw = PIPE_W // 2 - 2    # arrow half-width fits inside pipe
-            ah = aw + 3             # arrow height
-            alpha = min(230, 100 + int(mv_pct * 1.3))
-            arr_clr = QColor(255, 255, 255, alpha)
+            aw = PIPE_W // 2 - 2
+            ah = aw + 3
             p.save()
             p.setClipRect(QRect(px - PIPE_W // 2, y1, PIPE_W, y2 - y1))
             p.setPen(Qt.PenStyle.NoPen)
-            p.setBrush(arr_clr)
+            p.setBrush(QColor(255, 255, 255, min(230, 100 + int(mv_pct * 1.3))))
             pos = y1 + offset
             while pos < y2:
                 if going_down:
-                    pts = [QPoint(px, pos),
-                           QPoint(px - aw, pos - ah),
-                           QPoint(px + aw, pos - ah)]
+                    pts = [QPoint(px, pos), QPoint(px-aw, pos-ah), QPoint(px+aw, pos-ah)]
                 else:
-                    pts = [QPoint(px, pos),
-                           QPoint(px - aw, pos + ah),
-                           QPoint(px + aw, pos + ah)]
+                    pts = [QPoint(px, pos), QPoint(px-aw, pos+ah), QPoint(px+aw, pos+ah)]
                 p.drawPolygon(pts)
                 pos += spacing
             p.restore()
 
+        def _pipe_lbl(px, txt, clr):
+            """Pipe label with dark background patch."""
+            tw = fm8.horizontalAdvance(txt); th = fm8.height()
+            p.setPen(Qt.PenStyle.NoPen); p.setBrush(QColor(0, 0, 0, 160))
+            p.drawRect(px - tw//2 - 2, lbl_off - th, tw + 4, th + 1)
+            p.setPen(QPen(clr)); p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawText(px - tw//2, lbl_off, txt)
+
         def _ret_valve(rx, ry, clr, mv_pct):
-            """Animated return valve: bottom-fill + pulse glow (no spinning tick)."""
+            """Animated return valve: bottom-fill level + pulse glow ring."""
             p.setPen(QPen(clr, 2.0)); p.setBrush(QColor("#040C18"))
-            p.drawEllipse(rx-v_r, ry-v_r, 2*v_r, 2*v_r)
-            fill_h = max(1, int((2*v_r - 2) * mv_pct / 100.0))
+            p.drawEllipse(rx-V_R, ry-V_R, 2*V_R, 2*V_R)
+            fill_h = max(1, int((2*V_R - 2) * mv_pct / 100.0))
             p.save()
-            p.setClipRect(QRect(rx-v_r+1, ry+v_r-1-fill_h, 2*v_r-2, fill_h))
+            p.setClipRect(QRect(rx-V_R+1, ry+V_R-1-fill_h, 2*V_R-2, fill_h))
             p.setPen(Qt.PenStyle.NoPen)
             p.setBrush(QColor(clr.red(), clr.green(), clr.blue(), 170))
-            p.drawEllipse(rx-v_r+1, ry-v_r+1, 2*v_r-2, 2*v_r-2)
+            p.drawEllipse(rx-V_R+1, ry-V_R+1, 2*V_R-2, 2*V_R-2)
             p.restore()
             pulse = abs(math.sin(math.radians(self._angle * 4)))
             p.setPen(QPen(QColor(clr.red(), clr.green(), clr.blue(), int(110 * pulse)), 2.5))
             p.setBrush(Qt.BrushStyle.NoBrush)
-            p.drawEllipse(rx-v_r-3, ry-v_r-3, 2*v_r+6, 2*v_r+6)
-            p.setFont(QFont("Consolas", 8, QFont.Weight.Bold))
+            p.drawEllipse(rx-V_R-3, ry-V_R-3, 2*V_R+6, 2*V_R+6)
             p.setPen(QPen(QColor("#FFFFFF")))
-            p.drawText(QRect(rx-v_r, ry-v_r, 2*v_r, 2*v_r),
+            p.drawText(QRect(rx-V_R, ry-V_R, 2*V_R, 2*V_R),
                        Qt.AlignmentFlag.AlignCenter, f"{mv_pct:.0f}%")
 
         def _coil_pipes(vx, sup_clr, ret_clr, sup_lbl, ret_lbl, mv_pct):
-            sx = vx - dx   # supply pipe x
-            rx = vx + dx   # return pipe x
-            # Supply: thick pipe straight down, no valve
+            """Supply + return pipes with labels and animated return valve."""
+            sx = vx - DX; rx = vx + DX
             p.setPen(QPen(sup_clr, PIPE_W, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
-            p.drawLine(sx, stub_top, sx, lbl_y)
-            _flow_arrows(sx, stub_top, lbl_y, sup_clr, mv_pct, going_down=True)
-            # Return: thick pipe interrupted by valve
+            p.drawLine(sx, STUB_TOP, sx, lbl_y)
+            _flow_arrows(sx, STUB_TOP, lbl_y, mv_pct, going_down=True)
             p.setPen(QPen(ret_clr, PIPE_W, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
-            p.drawLine(rx, stub_top, rx, val_cy - v_r)
-            p.drawLine(rx, val_cy + v_r, rx, lbl_y)
-            _flow_arrows(rx, stub_top, val_cy - v_r, ret_clr, mv_pct, going_down=False)
-            _flow_arrows(rx, val_cy + v_r, lbl_y,    ret_clr, mv_pct, going_down=False)
-            # Labels — large enough to read, dark background patch
-            p.setFont(QFont("Consolas", 8, QFont.Weight.Bold))
-            fm8 = p.fontMetrics()
-            for lx_center, lbl_txt, lbl_clr in [
-                    (sx, sup_lbl, sup_clr), (rx, ret_lbl, ret_clr)]:
-                tw = fm8.horizontalAdvance(lbl_txt)
-                th = fm8.height()
-                bx = lx_center - tw // 2 - 2
-                by = lbl_off - th
-                p.setPen(Qt.PenStyle.NoPen)
-                p.setBrush(QColor(0, 0, 0, 160))
-                p.drawRect(bx, by, tw + 4, th + 1)
-                p.setPen(QPen(lbl_clr))
-                p.setBrush(Qt.BrushStyle.NoBrush)
-                p.drawText(lx_center - tw // 2, lbl_off, lbl_txt)
-            _ret_valve(rx, val_cy, ret_clr, mv_pct)
+            p.drawLine(rx, STUB_TOP, rx, VAL_CY - V_R)
+            p.drawLine(rx, VAL_CY + V_R, rx, lbl_y)
+            _flow_arrows(rx, STUB_TOP, VAL_CY - V_R, mv_pct, going_down=False)
+            _flow_arrows(rx, VAL_CY + V_R, lbl_y,    mv_pct, going_down=False)
+            _pipe_lbl(sx, sup_lbl, sup_clr)
+            _pipe_lbl(rx, ret_lbl, ret_clr)
+            _ret_valve(rx, VAL_CY, ret_clr, mv_pct)
 
-        # ── per-stage pipes ───────────────────────────────────────────
-        _coil_pipes(scx[1], HW_CLR,  HW_RET,  "HWS", "HWR", mv[0] if mv else 0)
-        _coil_pipes(scx[2], CHW_CLR, CHW_RET, "CWS", "CWR", mv[1] if mv else 0)
+        def _wash_pipe(vx, clr, lbl, mv_pct):
+            """Single supply pipe (washer) with animated valve."""
+            p.setPen(QPen(clr, PIPE_W, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+            p.drawLine(vx, STUB_TOP, vx, VAL_CY - V_R)
+            p.drawLine(vx, VAL_CY + V_R, vx, lbl_y)
+            _flow_arrows(vx, STUB_TOP, VAL_CY - V_R, mv_pct, going_down=True)
+            _flow_arrows(vx, VAL_CY + V_R, lbl_y,    mv_pct, going_down=True)
+            _pipe_lbl(vx, lbl, clr)
+            _ret_valve(vx, VAL_CY, clr, mv_pct)
 
-        # Washer: single supply pipe with animated valve
-        p.setPen(QPen(WSH_CLR, PIPE_W, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
-        p.drawLine(scx[3], stub_top, scx[3], val_cy - v_r)
-        p.drawLine(scx[3], val_cy + v_r, scx[3], lbl_y)
-        _flow_arrows(scx[3], stub_top, val_cy - v_r, WSH_CLR, mv[2] if mv else 0, going_down=True)
-        _flow_arrows(scx[3], val_cy + v_r, lbl_y,    WSH_CLR, mv[2] if mv else 0, going_down=True)
-        p.setFont(QFont("Consolas", 8, QFont.Weight.Bold))
-        fm8w = p.fontMetrics()
-        tw_ws = fm8w.horizontalAdvance("WS")
-        th_ws = fm8w.height()
-        p.setPen(Qt.PenStyle.NoPen); p.setBrush(QColor(0, 0, 0, 160))
-        p.drawRect(scx[3] - tw_ws//2 - 2, lbl_off - th_ws, tw_ws + 4, th_ws + 1)
-        p.setPen(QPen(WSH_CLR)); p.setBrush(Qt.BrushStyle.NoBrush)
-        p.drawText(scx[3] - tw_ws//2, lbl_off, "WS")
-        _ret_valve(scx[3], val_cy, WSH_CLR, mv[2] if mv else 0)
-
-        _coil_pipes(scx[4], CHW_CLR, CHW_RET, "CWS", "CWR", mv[3] if mv else 0)
-        _coil_pipes(scx[5], HW_CLR,  HW_RET,  "HWS", "HWR", mv[4] if mv else 0)
+        # ── per-stage pipe calls ──────────────────────────────────────────
+        _coil_pipes(scx[1], HW_S,  HW_R,  "HWS", "HWR", mvs[0])
+        _coil_pipes(scx[2], CHW_S, CHW_R, "CWS", "CWR", mvs[1])
+        _wash_pipe( scx[3], WSH_C,         "WS",          mvs[2])
+        _coil_pipes(scx[4], CHW_S, CHW_R, "CWS", "CWR", mvs[3])
+        _coil_pipes(scx[5], HW_S,  HW_R,  "HWS", "HWR", mvs[4])
 
         # ── STAGE LABEL RECTANGLES ───────────────────────────────────────
         stage_lbls = ["OA INLET","HTC-1","CC-1","WASHER","CC-2","HTC-2","SUPPLY FAN"]
@@ -824,15 +804,16 @@ class _PsychrometricChart(QWidget):
             "⑤ 再熱 Reheat",
             "⑥ 供氣 Supply",
         ]
-        seg_offsets = [(0, -14), (0, -14), (12, 6), (0, 14), (0, -14), (12, -14)]
-        p.setFont(QFont("Microsoft JhengHei", 7))
+        seg_offsets = [(0, -18), (0, -18), (14, 8), (0, 18), (0, -18), (14, -18)]
+        p.setFont(QFont("Microsoft JhengHei", 10, QFont.Weight.Bold))
         for i, (seg, lbl, (ox, oy)) in enumerate(zip(segs, seg_labels, seg_offsets)):
             if len(seg) < 2: continue
             mx = (seg[0][0] + seg[-1][0]) // 2 + ox
             my = (seg[0][1] + seg[-1][1]) // 2 + oy
             clr = QColor(_SACCNT[i]) if i < len(_SACCNT) else QColor("#AAAAAA")
-            p.setPen(QPen(QColor(0, 0, 0, 120)))
-            p.drawText(mx+1, my+1, lbl)
+            # Subtle dark shadow for depth, no opaque background box
+            p.setPen(QPen(QColor(0, 0, 0, 180)))
+            p.drawText(mx + 1, my + 1, lbl)
             p.setPen(QPen(clr))
             p.drawText(mx, my, lbl)
 
@@ -851,9 +832,9 @@ class _PsychrometricChart(QWidget):
             if sel_pt:
                 p.setPen(QPen(QColor("#FFFFFF"), 1.5)); p.setBrush(Qt.BrushStyle.NoBrush)
                 p.drawEllipse(px-r, py-r, 2*r, 2*r)
-            p.setPen(QPen(QColor("#FFFFFF") if sel_pt else QColor("#CCCCCC")))
-            p.setFont(QFont("Consolas", 8, QFont.Weight.Bold))
-            p.drawText(px+r+2, py-r, lbls[i])
+            p.setPen(QPen(QColor("#FFFFFF") if sel_pt else QColor("#E0E0E0")))
+            p.setFont(QFont("Consolas", 10, QFont.Weight.Bold))
+            p.drawText(px+r+3, py-r+2, lbls[i])
 
         # Axes
         x0a, y_ax = self._xy(0, 0); x1a, _ = self._xy(50, 0); _, y_top = self._xy(0, self.W_MAX)
@@ -1834,7 +1815,12 @@ class MauSimulator(BaseToolWindow):
             hl.addWidget(vw)
             return cw
 
-        g.addWidget(hdr("TARGET ZONE CONFIG", self._ACC), 0, 0, 1, 4)
+        # column 0: label, 1: SP spin, 2: tol spin, 3: unit, 4: stretch
+        g.setColumnStretch(0, 0); g.setColumnStretch(1, 0)
+        g.setColumnStretch(2, 0); g.setColumnStretch(3, 0)
+        g.setColumnStretch(4, 1)
+
+        g.addWidget(hdr("TARGET ZONE CONFIG", self._ACC), 0, 0, 1, 5)
         g.addWidget(hdr("TEMP SETPOINT"), 1, 0)
         self._T_sp_in = vi("22","#FF6B6B"); self._T_tol_in = vi("±2","#FF9999")
         g.addWidget(_mk_spin(self._T_sp_in,  0.1, -20.0, 50.0),          1, 1)
@@ -1850,7 +1836,7 @@ class MauSimulator(BaseToolWindow):
         self._cur_lbl = QLabel("—")
         self._cur_lbl.setStyleSheet(f"color:{self._ACC};font-size:10pt;font-weight:700;"
                                     f"background:transparent;border:none;font-family:Consolas;")
-        g.addWidget(hdr("CURRENT STATUS"), 3, 0); g.addWidget(self._cur_lbl, 3, 1, 1, 3)
+        g.addWidget(hdr("CURRENT STATUS"), 3, 0); g.addWidget(self._cur_lbl, 3, 1, 1, 4)
         self._T_sp = 22.0; self._RH_sp = 50.0; self._T_tol = 2.0; self._RH_tol = 5.0
         return f
 
