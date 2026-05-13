@@ -6,16 +6,19 @@ import math
 from collections import deque
 from dataclasses import dataclass
 
-from PyQt6.QtCore    import Qt, QTimer, QRect, QPoint, QPointF
+from PyQt6.QtCore    import (Qt, QTimer, QThread, QRect, QPoint, QPointF,
+                              pyqtSignal, pyqtSlot, QPropertyAnimation, QEasingCurve)
 from PyQt6.QtGui     import (QPainter, QColor, QPen, QPainterPath,
                               QFont, QPolygonF, QBrush, QLinearGradient)
+from PyQt6.QtCore    import QObject
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QLabel, QFrame,
     QVBoxLayout, QHBoxLayout, QGridLayout,
     QPushButton, QLineEdit, QComboBox,
-    QScrollArea, QStackedWidget,
+    QScrollArea, QStackedWidget, QFileDialog,
 )
-from styles import BaseToolWindow
+from styles import (BaseToolWindow, load_config, save_config,
+                    THEMES, get_theme_idx, ThemePicker)
 
 
 # ═══════════════════════════════════════════════════════
@@ -859,7 +862,7 @@ class _StageFaceplate(QFrame):
     TH = 80
 
     def __init__(self, name: str, pid: PidCtrl, fopdt: FopdtCoil,
-                 pv_lo: float, pv_hi: float, select_cb=None, pv_modes=None):
+                 pv_lo: float, pv_hi: float, select_cb=None, pv_modes=None, on_change=None):
         super().__init__()
         self._name = name; self._pid = pid; self._fopdt = fopdt
         # pv_modes: list of (label, lo, hi, default_sp)
@@ -872,6 +875,7 @@ class _StageFaceplate(QFrame):
             self._sp = (pv_lo + pv_hi) / 2.0
         self._pv_lo = pv_lo; self._pv_hi = pv_hi
         self._select_cb = select_cb; self._selected = False
+        self._on_change = on_change
         self.setMinimumWidth(210); self.setMaximumWidth(280); self.setMinimumHeight(360)
         self._update_border(); self._build()
 
@@ -1037,11 +1041,13 @@ class _StageFaceplate(QFrame):
         self._mode_btn.setText("AUTO" if checked else "MAN")
         self._mode_btn.setStyleSheet(self._mode_qss(checked))
         self._mv_widget.setVisible(not checked)
+        if self._on_change: self._on_change()
 
     def _commit_sp(self):
         try: v = float(self._sp_in.text())
         except: v = self._sp
         self._sp = max(self._pv_lo, min(self._pv_hi, v)); self._sp_in.setText(f"{self._sp:.1f}")
+        if self._on_change: self._on_change()
 
     def _commit_mv(self):
         try: v = float(self._mv_in.text())
@@ -1054,6 +1060,7 @@ class _StageFaceplate(QFrame):
         except: pass
         try: hi = float(self._pvhi_in.text()); self._pv_hi = max(self._pv_lo+1, hi)
         except: pass
+        if self._on_change: self._on_change()
 
     def _commit_pid(self):
         try: self._pid.Kp = max(0.0, float(self._kp_in.text()))
@@ -1062,6 +1069,7 @@ class _StageFaceplate(QFrame):
         except: pass
         try: self._pid.Kd = max(0.0, float(self._kd_in.text()))
         except: pass
+        if self._on_change: self._on_change()
 
     def _commit_fopdt(self):
         try: self._fopdt.Kp  = max(0.001, float(self._fkp.text()))
@@ -1070,6 +1078,34 @@ class _StageFaceplate(QFrame):
         except: pass
         try: self._fopdt.L   = max(0.0,   float(self._fL.text()))
         except: pass
+        if self._on_change: self._on_change()
+
+    def get_state(self) -> dict:
+        return {
+            "sp": self._sp, "pv_lo": self._pv_lo, "pv_hi": self._pv_hi,
+            "pid_kp": self._pid.Kp, "pid_ki": self._pid.Ki, "pid_kd": self._pid.Kd,
+            "fo_kp": self._fopdt.Kp, "fo_tau": self._fopdt.tau, "fo_l": self._fopdt.L,
+            "auto": self._pid.auto, "pv_mode_idx": self._pv_mode_idx,
+        }
+
+    def set_state(self, d: dict):
+        if "pv_mode_idx" in d and self._pv_modes and d["pv_mode_idx"] != self._pv_mode_idx:
+            self._set_pv_mode(d["pv_mode_idx"])
+        if "sp"     in d: self._sp = d["sp"];              self._sp_in.setText(f"{self._sp:.1f}")
+        if "pv_lo"  in d: self._pv_lo = d["pv_lo"];        self._pvlo_in.setText(f"{self._pv_lo:.4g}")
+        if "pv_hi"  in d: self._pv_hi = d["pv_hi"];        self._pvhi_in.setText(f"{self._pv_hi:.4g}")
+        if "pid_kp" in d: self._pid.Kp = d["pid_kp"];      self._kp_in.setText(f"{self._pid.Kp:.4g}")
+        if "pid_ki" in d: self._pid.Ki = d["pid_ki"];      self._ki_in.setText(f"{self._pid.Ki:.4g}")
+        if "pid_kd" in d: self._pid.Kd = d["pid_kd"];      self._kd_in.setText(f"{self._pid.Kd:.4g}")
+        if "fo_kp"  in d: self._fopdt.Kp = d["fo_kp"];     self._fkp.setText(f"{self._fopdt.Kp:.4g}")
+        if "fo_tau" in d: self._fopdt.tau = d["fo_tau"];   self._fta.setText(f"{self._fopdt.tau:.1f}")
+        if "fo_l"   in d: self._fopdt.L = d["fo_l"];       self._fL.setText(f"{self._fopdt.L:.1f}")
+        if "auto" in d:
+            self._pid.auto = d["auto"]
+            self._mode_btn.setChecked(d["auto"])
+            self._mode_btn.setText("AUTO" if d["auto"] else "MAN")
+            self._mode_btn.setStyleSheet(self._mode_qss(d["auto"]))
+            self._mv_widget.setVisible(not d["auto"])
 
     def update_display(self, pv: float, mv: float):
         span = max(1e-6, self._pv_hi - self._pv_lo)
@@ -1164,36 +1200,392 @@ class _ConnectionOverlay(QWidget):
 
 
 # ═══════════════════════════════════════════════════════
+#  SIMULATION WORKER  (runs in QThread, owns sim state)
+# ═══════════════════════════════════════════════════════
+class _SimWorker(QObject):
+    """All heavy simulation math runs here; emits results to the UI thread."""
+    stepped = pyqtSignal(list, list, float, float)  # states, mvs, p_static, fan_hz
+    _DT = 0.05
+
+    def __init__(self, pid, fo, fp, oa_fn):
+        super().__init__()
+        self._pid = pid; self._fo = fo; self._fp = fp; self._oa_fn = oa_fn
+        self._states: list = []; self._fan_hz = 45.0; self._p_static = 2000.0
+        self._speed = 1
+
+    @pyqtSlot()
+    def start_sim(self):
+        if not hasattr(self, '_timer'):
+            self._timer = QTimer()
+            self._timer.timeout.connect(self._tick)
+        if not self._timer.isActive():
+            self._timer.start(50)
+
+    @pyqtSlot()
+    def stop_sim(self):
+        if hasattr(self, '_timer'): self._timer.stop()
+
+    @pyqtSlot()
+    def reset_sim(self):
+        oa = self._oa_fn()
+        self._states = [oa.copy() for _ in range(7)]
+        self._fan_hz = 45.0; self._p_static = 2000.0
+        for p in self._pid: p.reset()
+        for f in self._fo: f.reset()
+
+    @pyqtSlot(int)
+    def set_speed(self, v): self._speed = v
+
+    def _tick(self):
+        for _ in range(self._speed):
+            self._step(self._DT)
+        self.stepped.emit(
+            [s.copy() for s in self._states],
+            [p.mv for p in self._pid],
+            self._p_static, self._fan_hz,
+        )
+
+    def _step(self, dt):
+        if not self._states: return
+        oa = self._oa_fn(); s = [oa.copy() for _ in range(7)]
+
+        mv_fan = self._pid[5].compute(self._p_static, self._fp[5].sp, dt)
+        self._fan_hz = 30.0 + (mv_fan / 100.0) * 30.0
+        fan_sc = 45.0 / max(self._fan_hz, 1.0)
+        self._p_static = max(100.0, self._fo[5].step(mv_fan, dt, 1.0))
+
+        # Low-airflow interlock: coil effectiveness capped to 5% when fan MV < 8%
+        coil_ilock = 0.05 if mv_fan < 8.0 else 1.0
+
+        pv_htc1 = self._states[1].h if self._fp[0].pv_mode_idx == 1 else self._states[1].T
+        mv1 = self._pid[0].compute(pv_htc1, self._fp[0].sp, dt)
+        T1 = min(40.0, oa.T + self._fo[0].step(mv1, dt, fan_sc) * coil_ilock)
+        s[1] = AirState(T=T1, w=oa.w)
+
+        mv2 = self._pid[1].compute(self._states[2].T, self._fp[1].sp, dt)
+        T2 = max(7.0, s[1].T + self._fo[1].step(mv2, dt, fan_sc) * coil_ilock)
+        w2 = s[1].w
+        if T2 < Psych.t_dp(w2): w2 = max(0.0, Psych.omega_sat(T2))
+        s[2] = AirState(T=T2, w=w2)
+
+        mv3 = self._pid[2].compute(self._states[3].RH, self._fp[2].sp, dt)
+        eta = min(0.92, max(0.0, self._fo[2].step(mv3, dt, 1.0) / 100.0)) * coil_ilock
+        T_wb = Psych.t_wb(s[2].T, s[2].w); w_sat_wb = Psych.omega_sat(T_wb)
+        T3 = s[2].T - eta * (s[2].T - T_wb)
+        w3 = min(s[2].w + eta * (w_sat_wb - s[2].w), Psych.omega_sat(T3))
+        s[3] = AirState(T=T3, w=w3)
+
+        mv4 = self._pid[3].compute(self._states[4].T_dp, self._fp[3].sp, dt)
+        T4 = max(7.0, s[3].T + self._fo[3].step(mv4, dt, fan_sc) * coil_ilock)
+        w4 = s[3].w
+        if T4 < Psych.t_dp(s[3].w): w4 = max(0.0, Psych.omega_sat(T4))
+        s[4] = AirState(T=T4, w=w4)
+
+        mv5 = self._pid[4].compute(self._states[5].T, self._fp[4].sp, dt)
+        T5 = min(40.0, s[4].T + self._fo[4].step(mv5, dt, fan_sc) * coil_ilock)
+        s[5] = AirState(T=T5, w=s[4].w)
+
+        s[6] = s[5].copy(); self._states = s
+
+
+# ═══════════════════════════════════════════════════════
+#  TREND CHART  (QPainter rolling buffer, no pyqtgraph)
+# ═══════════════════════════════════════════════════════
+class _TrendChart(QWidget):
+    """Rolling trend chart: auto Y-axis, dual Y-axis (PV left / MV right),
+    wheel-zoom X, hover crosshair tooltip, PV/SP/MV toggle buttons."""
+    _BG   = "#040C18"
+    _GRID = "#0A1830"
+    NPTS  = 300        # 300 × 50 ms = 15 s at speed=1
+    PL, PR, PT, PB = 44, 40, 18, 16   # plot margins
+
+    def __init__(self):
+        super().__init__()
+        self._bufs = {i: (deque(maxlen=self.NPTS),
+                          deque(maxlen=self.NPTS),
+                          deque(maxlen=self.NPTS))
+                      for i in range(6)}
+        self._sel      = -1
+        self._pv_lo    = 0.0;  self._pv_hi = 100.0
+        self._name     = "";   self._acc   = "#00B4D8"
+        self._zoom_pts = self.NPTS    # visible X window (wheel-controlled)
+        self._hover_x  = -1.0         # mouse X pixel (-1 = no hover)
+        self._show_pv  = True
+        self._show_sp  = True
+        self._show_mv  = True
+
+        self.setFixedHeight(110)
+        self.setStyleSheet("background:#040C18;border:1px solid #0A1830;border-radius:4px;")
+        self.setMouseTracking(True)
+
+        # Toggle buttons (child widgets, positioned in resizeEvent)
+        def _tbtn(label, fg, checked_bg):
+            b = QPushButton(label, self)
+            b.setCheckable(True); b.setChecked(True); b.setFixedSize(24, 13)
+            b.setStyleSheet(
+                f"QPushButton{{background:#080F1C;color:{fg};border:1px solid #1A3050;"
+                f"border-radius:2px;font-size:6pt;font-family:Consolas;font-weight:700;padding:0;}}"
+                f"QPushButton:checked{{background:{checked_bg};color:#000;border:1px solid {checked_bg};}}"
+                f"QPushButton:!checked{{color:#333;border-color:#111;}}"
+            )
+            return b
+        self._btn_pv = _tbtn("PV", "#00B4D8", "#00B4D8")
+        self._btn_sp = _tbtn("SP", "#AAAAAA", "#888888")
+        self._btn_mv = _tbtn("MV", "#FF7700", "#FF7700")
+        for btn, attr in [(self._btn_pv,"_show_pv"),
+                          (self._btn_sp,"_show_sp"),
+                          (self._btn_mv,"_show_mv")]:
+            btn.toggled.connect(lambda v, a=attr: (setattr(self, a, v), self.update()))
+
+    # ── external API ────────────────────────────────────
+    def push(self, idx: int, pv: float, sp: float, mv: float):
+        b = self._bufs[idx]; b[0].append(pv); b[1].append(sp); b[2].append(mv)
+
+    def select(self, fp_idx: int, name: str, pv_lo: float, pv_hi: float, acc: str):
+        self._sel = fp_idx; self._name = name.replace("\n", " ")
+        self._pv_lo = pv_lo; self._pv_hi = pv_hi; self._acc = acc
+        # Sync PV button colour to stage accent
+        self._btn_pv.setStyleSheet(
+            f"QPushButton{{background:#080F1C;color:{acc};border:1px solid #1A3050;"
+            f"border-radius:2px;font-size:6pt;font-family:Consolas;font-weight:700;padding:0;}}"
+            f"QPushButton:checked{{background:{acc};color:#000;border:1px solid {acc};}}"
+            f"QPushButton:!checked{{color:#333;border-color:#111;}}"
+        )
+        self.update()
+
+    def clear_selection(self):
+        self._sel = -1; self.update()
+
+    # ── Qt events ───────────────────────────────────────
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        W = self.width()
+        for i, btn in enumerate((self._btn_pv, self._btn_sp, self._btn_mv)):
+            btn.move(W - 4 - (3 - i) * 27, 2)
+
+    def wheelEvent(self, e):
+        delta = e.angleDelta().y()
+        if delta > 0:
+            self._zoom_pts = max(30, int(self._zoom_pts * 0.78))
+        else:
+            self._zoom_pts = min(self.NPTS, int(self._zoom_pts * 1.28))
+        self.update()
+
+    def mouseMoveEvent(self, e):
+        self._hover_x = e.position().x()
+        self.update()
+
+    def leaveEvent(self, e):
+        self._hover_x = -1.0
+        self.update()
+
+    # ── paint ───────────────────────────────────────────
+    def paintEvent(self, _):
+        W, H = self.width(), self.height()
+        PL, PR, PT, PB = self.PL, self.PR, self.PT, self.PB
+        pw = W - PL - PR
+        ph = H - PT - PB
+        if pw < 10 or ph < 10: return
+
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.fillRect(self.rect(), QColor(self._BG))
+
+        if self._sel < 0:
+            p.setFont(QFont("Consolas", 8))
+            p.setPen(QPen(QColor("#1A3A5A")))
+            p.drawText(PL, PT, pw, ph, Qt.AlignmentFlag.AlignCenter,
+                       "Click a stage to show trend")
+            p.end(); return
+
+        pv_b, sp_b, mv_b = self._bufs[self._sel]
+        n = min(len(pv_b), self._zoom_pts)
+        pv_win = list(pv_b)[-n:] if n else []
+        sp_win = list(sp_b)[-n:] if n else []
+        mv_win = list(mv_b)[-n:] if n else []
+
+        # ── Auto Y-axis for PV/SP ───────────────────────
+        all_pv_sp = []
+        if self._show_pv and pv_win: all_pv_sp.extend(pv_win)
+        if self._show_sp and sp_win: all_pv_sp.extend(sp_win)
+        if all_pv_sp:
+            y_min = min(all_pv_sp); y_max = max(all_pv_sp)
+            pad = max(0.5, (y_max - y_min) * 0.15)
+            y_min -= pad; y_max += pad
+        else:
+            y_min, y_max = self._pv_lo, self._pv_hi
+        y_span = max(1e-4, y_max - y_min)
+
+        # ── Background + grid ───────────────────────────
+        p.fillRect(PL, PT, pw, ph, QColor("#03090F"))
+        p.setPen(QPen(QColor(self._GRID), 1))
+        NGRID = 4
+        for gi in range(NGRID + 1):
+            gy = PT + int(gi * ph / NGRID)
+            p.drawLine(PL, gy, PL + pw, gy)
+        for gi in range(6):
+            gx = PL + int(gi * pw / 5)
+            p.drawLine(gx, PT, gx, PT + ph)
+
+        # ── Left Y-axis labels (PV/SP scale) ────────────
+        p.setFont(QFont("Consolas", 7))
+        p.setPen(QPen(QColor("#2A5A7A")))
+        for gi in range(NGRID + 1):
+            val = y_max - gi * y_span / NGRID
+            gy  = PT + int(gi * ph / NGRID)
+            p.drawText(0, gy - 6, PL - 3, 12,
+                       Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
+                       f"{val:.1f}")
+
+        # ── Right Y-axis labels (MV 0-100%) ─────────────
+        if self._show_mv:
+            p.setPen(QPen(QColor("#7A4A1A")))
+            for gi in range(3):
+                val = 100 - gi * 50
+                gy  = PT + int(gi * ph / 2)
+                p.drawText(PL + pw + 3, gy - 6, PR - 3, 12,
+                           Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                           f"{val:.0f}%")
+
+        # ── Coordinate helpers ───────────────────────────
+        def _px_pv(k, v):
+            x = PL + int(k * pw / max(1, n - 1))
+            r = (v - y_min) / y_span
+            return QPoint(x, PT + ph - max(0, min(ph, int(r * ph))))
+
+        def _px_mv(k, v):
+            x = PL + int(k * pw / max(1, n - 1))
+            r = max(0.0, min(1.0, v / 100.0))
+            return QPoint(x, PT + ph - int(r * ph))
+
+        def _draw_line(win, to_pt, clr, width, style=Qt.PenStyle.SolidLine):
+            if len(win) < 2: return
+            pen = QPen(QColor(clr), width, style)
+            pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+            p.setPen(pen)
+            prev = None
+            for k, v in enumerate(win):
+                pt = to_pt(k, v)
+                if prev: p.drawLine(prev, pt)
+                prev = pt
+
+        # ── Draw curves ──────────────────────────────────
+        if self._show_sp:
+            _draw_line(sp_win, _px_pv, "#778888", 1, Qt.PenStyle.DashLine)
+        if self._show_mv:
+            _draw_line(mv_win, _px_mv, "#CC5500", 1, Qt.PenStyle.DotLine)
+        if self._show_pv:
+            _draw_line(pv_win, _px_pv, self._acc, 2)
+
+        # ── Hover crosshair + tooltip ────────────────────
+        hx = self._hover_x
+        if PL <= hx <= PL + pw and n > 1:
+            ix = int((hx - PL) / pw * (n - 1) + 0.5)
+            ix = max(0, min(ix, n - 1))
+            cross_x = PL + int(ix * pw / max(1, n - 1))
+
+            p.setPen(QPen(QColor("#FFFFFF50"), 1, Qt.PenStyle.DashLine))
+            p.drawLine(cross_x, PT, cross_x, PT + ph)
+
+            # Marker dots
+            if self._show_pv and ix < len(pv_win):
+                dp = _px_pv(ix, pv_win[ix])
+                p.setPen(Qt.PenStyle.NoPen)
+                p.setBrush(QBrush(QColor(self._acc)))
+                p.drawEllipse(dp, 3, 3)
+            if self._show_mv and ix < len(mv_win):
+                dm = _px_mv(ix, mv_win[ix])
+                p.setBrush(QBrush(QColor("#FF7700")))
+                p.drawEllipse(dm, 3, 3)
+            p.setBrush(Qt.BrushStyle.NoBrush)
+
+            # Tooltip box
+            tip_lines, tip_clrs = [], []
+            if self._show_pv and ix < len(pv_win):
+                tip_lines.append(f"PV  {pv_win[ix]:.2f}"); tip_clrs.append(self._acc)
+            if self._show_sp and ix < len(sp_win):
+                tip_lines.append(f"SP  {sp_win[ix]:.2f}"); tip_clrs.append("#888888")
+            if self._show_mv and ix < len(mv_win):
+                tip_lines.append(f"MV  {mv_win[ix]:.1f}%"); tip_clrs.append("#FF7700")
+
+            if tip_lines:
+                p.setFont(QFont("Consolas", 7, QFont.Weight.Bold))
+                lh, bw_box, bpad = 13, 80, 4
+                bh = len(tip_lines) * lh + bpad * 2
+                bx = cross_x + 8
+                by = PT + 4
+                if bx + bw_box > PL + pw: bx = cross_x - bw_box - 6
+                p.fillRect(bx, by, bw_box, bh, QColor("#0D1E33E0"))
+                p.setPen(QPen(QColor("#2A4A6A"), 1))
+                p.drawRect(bx, by, bw_box, bh)
+                for i, (line, clr) in enumerate(zip(tip_lines, tip_clrs)):
+                    p.setPen(QPen(QColor(clr)))
+                    p.drawText(bx + bpad, by + bpad + i * lh, bw_box - bpad, lh,
+                               Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                               line)
+
+        # ── Header label ─────────────────────────────────
+        pv_now = pv_b[-1] if pv_b else 0.0
+        sp_now = sp_b[-1] if sp_b else 0.0
+        mv_now = mv_b[-1] if mv_b else 0.0
+        zoom_s = f"  [{n}pt]" if n < self.NPTS else ""
+        p.setFont(QFont("Consolas", 7, QFont.Weight.Bold))
+        p.setPen(QPen(QColor(self._acc)))
+        p.drawText(PL + 2, 0, pw - 85, PT, Qt.AlignmentFlag.AlignVCenter,
+                   f"{self._name}   PV {pv_now:.1f}  SP {sp_now:.1f}  MV {mv_now:.0f}%{zoom_s}")
+
+        # ── Bottom time label ─────────────────────────────
+        secs = n * 0.05
+        p.setFont(QFont("Consolas", 6))
+        p.setPen(QPen(QColor("#2A4A6A")))
+        p.drawText(PL, PT + ph + 1, pw, PB - 1, Qt.AlignmentFlag.AlignCenter,
+                   f"← {secs:.0f} s →  (wheel to zoom)")
+
+        p.end()
+
+
+# ── Stage configuration table ──────────────────────────────────────────────
+# (name, pv_lo, pv_hi, default_sp,
+#  pid=(Kp,Ki,Kd,reverse), fo=(Kp,tau,L,heating), pv_modes_or_None)
+_STAGE_DEFS = [
+    ("HTC-1\nPREHEAT",   0.0,    40.0,   22.0,
+     (2.5,  0.08, 0.0, True),  (0.28, 55.0,  5.0, True),
+     [("T °C", 0.0, 40.0, 22.0), ("H kJ/kg", 0.0, 100.0, 40.0)]),
+    ("CC-1\nPRECOOL",    7.0,    40.0,   24.0,
+     (1.8,  0.05, 0.0, False), (0.22, 65.0,  6.0, False), None),
+    ("WASHER\nHUMIDIFY", 50.0,  100.0,  100.0,
+     (2.0,  0.10, 0.0, True),  (3.0,  30.0,  3.0, True),  None),
+    ("CC-2\nDEHUMID",    7.0,    30.0,   10.0,
+     (3.0,  0.15, 0.0, False), (0.22, 35.0,  4.0, False), None),
+    ("HTC-2\nREHEAT",    7.0,    40.0,   22.0,
+     (2.0,  0.10, 0.0, True),  (0.28, 45.0,  5.0, True),  None),
+    ("SUPPLY\nFAN",      500.0, 4000.0, 2000.0,
+     (0.05, 0.03, 0.0, True),  (40.0, 10.0,  1.0, True),  None),
+]
+
+# ═══════════════════════════════════════════════════════
 #  MAIN WINDOW
 # ═══════════════════════════════════════════════════════
 class MauSimulator(BaseToolWindow):
     _BG = "#050B18"; _CELL = "#0A1428"; _BDR = "#162440"; _ACC = "#00B4D8"
     _DT = 0.05
+    _sig_pause  = pyqtSignal()   # → worker.stop_sim
+    _sig_resume = pyqtSignal()   # → worker.start_sim
 
     def __init__(self):
         super().__init__("🌬️ MAU PRO-SIM 7X   Industrial Psychrometrics Engine", 1400, 900)
+        self._theme_idx = get_theme_idx()
+        t = THEMES[self._theme_idx]
+        self._BG = t["bg"]; self._CELL = t["cell"]; self._BDR = t["bdr"]; self._ACC = t["acc"]
         self.setMinimumSize(900, 600); self.content.setStyleSheet(f"background:{self._BG};")
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self._climate = "Winter"; self._speed = 1; self._sel = -1
         self._custom_T = 20.0; self._custom_RH = 60.0
         self._states = [AirState(6.0, Psych.omega(6.0, 50.0))] * 7
         self._fan_hz = 45.0; self._p_static = 2000.0
 
-        self._pid = [
-            PidCtrl(2.5, 0.08, 0.0, reverse=True),    # 0 HTC1
-            PidCtrl(1.8, 0.05, 0.0, reverse=False),    # 1 CC1
-            PidCtrl(2.0, 0.10, 0.0, reverse=True),     # 2 Washer (on RH)
-            PidCtrl(3.0, 0.15, 0.0, reverse=False),    # 3 CC2
-            PidCtrl(2.0, 0.10, 0.0, reverse=True),     # 4 HTC2
-            PidCtrl(0.05, 0.03, 0.0, reverse=True),    # 5 Fan
-        ]
-        self._fo = [
-            FopdtCoil(0.28, 55.0, 5.0, heating=True),    # HTC1  (HW=40°C → max ΔT≈30°C)
-            FopdtCoil(0.22, 65.0, 6.0, heating=False),   # CC1   (CHW=7°C → max ΔT≈13°C)
-            FopdtCoil(3.0,  30.0, 3.0, heating=True),    # Washer (effectiveness lag)
-            FopdtCoil(0.22, 35.0, 4.0, heating=False),   # CC2   (CHW=7°C → max ΔT≈10°C)
-            FopdtCoil(0.28, 45.0, 5.0, heating=True),    # HTC2  (HW=40°C → max ΔT≈30°C)
-            FopdtCoil(40.0, 10.0, 1.0, heating=True),    # Fan (Pa response)
-        ]
+        self._pid = [PidCtrl(*d[4][:3], reverse=d[4][3]) for d in _STAGE_DEFS]
+        self._fo  = [FopdtCoil(*d[5][:3], heating=d[5][3]) for d in _STAGE_DEFS]
 
         root = QVBoxLayout(self.content); root.setContentsMargins(4,4,4,4); root.setSpacing(4)
         root.addWidget(self._build_toolbar())
@@ -1221,12 +1613,29 @@ class MauSimulator(BaseToolWindow):
         self._overlay.setGeometry(self.content.rect())
         self._overlay.raise_()
 
-        self._timer = QTimer(self); self._timer.timeout.connect(self._tick)
+        self._ui_tick = 0; self._alarm_ticks = 0
+        self._states: list = []; self._latest_mvs: list = [0.0] * 6
+        self._p_static = 2000.0; self._fan_hz = 45.0
+
+        # Simulation runs in a dedicated QThread; UI receives results via signal
+        self._sim_thread = QThread(self)
+        self._worker = _SimWorker(self._pid, self._fo, self._fp, self._oa)
+        self._worker.moveToThread(self._sim_thread)
+        self._worker.stepped.connect(self._on_sim_stepped)
+        self._sim_thread.started.connect(self._worker.start_sim)
+        self._sig_pause.connect(self._worker.stop_sim)
+        self._sig_resume.connect(self._worker.start_sim)
+        # Thread and timers start in showEvent (not here)
+
+        # UI repaint timer (schematic animation only)
+        self._ui_timer = QTimer(self); self._ui_timer.timeout.connect(self._refresh_anim)
+
         self._reset()
+        self._load_mau_config()
 
     # ── layout ──────────────────────────────────────────
     def _build_toolbar(self):
-        f = QFrame(); f.setFixedHeight(118)
+        f = QFrame(); f.setFixedHeight(138)
         f.setStyleSheet("QFrame{background:#06091A;border-bottom:1px solid #162440;border-radius:0px;}")
         h = QHBoxLayout(f); h.setContentsMargins(18, 10, 18, 10); h.setSpacing(18)
 
@@ -1325,13 +1734,26 @@ class MauSimulator(BaseToolWindow):
                           f"font-family:Consolas;}}QComboBox::drop-down{{border:none;width:10px;}}"
                           f"QComboBox QAbstractItemView{{background:#0A1428;color:#CCC;"
                           f"border:1px solid #1A2A40;}}")
-        spd.currentIndexChanged.connect(lambda i: setattr(self, "_speed", [1,2,5,10][i]))
+        spd.currentIndexChanged.connect(lambda i: self._set_speed([1,2,5,10][i]))
         rst = QPushButton("⟳ RESET"); rst.setFixedSize(82, 28)
         rst.setStyleSheet("QPushButton{background:#181800;color:#AAAA00;border:1px solid #333300;"
                           "border-radius:3px;font-size:9pt;font-weight:700;font-family:Consolas;}"
                           "QPushButton:hover{background:#222200;color:#FFFF00;}")
         rst.clicked.connect(self._reset)
-        ctrl_v.addWidget(spd); ctrl_v.addWidget(rst); h.addLayout(ctrl_v)
+        exp = QPushButton("↓ EXPORT"); exp.setFixedSize(82, 28)
+        exp.setStyleSheet("QPushButton{background:#0A1C10;color:#44CC66;border:1px solid #1A4020;"
+                          "border-radius:3px;font-size:9pt;font-weight:700;font-family:Consolas;}"
+                          "QPushButton:hover{background:#102810;color:#66FF88;}")
+        exp.clicked.connect(self._export_report)
+        tp_row = QHBoxLayout(); tp_row.setContentsMargins(0,0,0,0); tp_row.setSpacing(3)
+        tp_lbl = QLabel("THEME:")
+        tp_lbl.setStyleSheet("color:#3A5A7A;font-size:8pt;font-weight:600;background:transparent;"
+                             "border:none;font-family:Consolas;")
+        self._theme_picker = ThemePicker(self._apply_theme)
+        tp_row.addWidget(tp_lbl); tp_row.addWidget(self._theme_picker); tp_row.addStretch()
+        ctrl_v.addWidget(spd); ctrl_v.addWidget(rst); ctrl_v.addWidget(exp)
+        ctrl_v.addLayout(tp_row)
+        h.addLayout(ctrl_v)
 
         h.addStretch()
 
@@ -1373,6 +1795,32 @@ class MauSimulator(BaseToolWindow):
         title_v.addWidget(t1); title_v.addWidget(t2); h.addLayout(title_v)
         return f
 
+    def _apply_theme(self, idx: int):
+        old_t = THEMES[self._theme_idx]
+        new_t = THEMES[idx]
+        self._theme_idx = idx
+        self._BG   = new_t["bg"];   self._CELL = new_t["cell"]
+        self._BDR  = new_t["bdr"]; self._ACC  = new_t["acc"]
+        mapping = [
+            (old_t["bg"],         new_t["bg"]),
+            (old_t["toolbar_bg"], new_t["toolbar_bg"]),
+            (old_t["cell"],       new_t["cell"]),
+            (old_t["card_bg"],    new_t["card_bg"]),
+            (old_t["bdr"],        new_t["bdr"]),
+            (old_t["acc"],        new_t["acc"]),
+        ]
+        for w in [self] + list(self.findChildren(QWidget)):
+            ss = w.styleSheet()
+            if not ss:
+                continue
+            changed = False
+            for old_c, new_c in mapping:
+                if old_c in ss:
+                    ss = ss.replace(old_c, new_c)
+                    changed = True
+            if changed:
+                w.setStyleSheet(ss)
+
     def _build_left(self):
         f = QFrame(); f.setStyleSheet(f"QFrame{{background:{self._BG};border:none;}}")
         lay = QVBoxLayout(f); lay.setContentsMargins(0,0,0,0); lay.setSpacing(4)
@@ -1380,7 +1828,48 @@ class MauSimulator(BaseToolWindow):
         self._schematic.setMinimumHeight(300)
         self._schematic.setMaximumHeight(380)
         lay.addWidget(self._schematic, 1)
+        # ── trend chart + zoom toggle ─────────────────────
+        trend_wrap = QFrame()
+        trend_wrap.setStyleSheet("QFrame{background:transparent;border:none;}")
+        tw_lay = QVBoxLayout(trend_wrap); tw_lay.setContentsMargins(0,0,0,0); tw_lay.setSpacing(0)
+
+        zoom_bar = QWidget(); zoom_bar.setFixedHeight(20)
+        zoom_bar.setStyleSheet("background:transparent;")
+        zb_lay = QHBoxLayout(zoom_bar); zb_lay.setContentsMargins(0,0,4,0)
+        self._zoom_btn = QPushButton("⛶")
+        self._zoom_btn.setFixedSize(20, 16)
+        self._zoom_btn.setToolTip("展開 / 收合趨勢圖")
+        self._zoom_btn.setStyleSheet(
+            "QPushButton{background:#0A1830;color:#4A7A9A;border:1px solid #1A3050;"
+            "border-radius:3px;font-size:9pt;padding:0;}"
+            "QPushButton:hover{color:#00B4D8;border-color:#00B4D8;}"
+        )
+        self._zoom_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        zb_lay.addStretch(); zb_lay.addWidget(self._zoom_btn)
+        tw_lay.addWidget(zoom_bar)
+
+        self._trend = _TrendChart()
+        tw_lay.addWidget(self._trend)
+        self._trend_expanded = False
+        self._zoom_btn.clicked.connect(self._toggle_trend_zoom)
+        lay.addWidget(trend_wrap)
         return f
+
+    def _toggle_trend_zoom(self):
+        self._trend_expanded = not self._trend_expanded
+        target = 260 if self._trend_expanded else 110
+        self._zoom_btn.setText("⊟" if self._trend_expanded else "⛶")
+        # Allow widget to resize during animation
+        self._trend.setMinimumHeight(0)
+        self._trend.setMaximumHeight(9999)
+        anim = QPropertyAnimation(self._trend, b"maximumHeight", self)
+        anim.setDuration(220)
+        anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        anim.setStartValue(self._trend.height())
+        anim.setEndValue(target)
+        anim.finished.connect(lambda t=target: self._trend.setFixedHeight(t))
+        self._trend_anim = anim   # prevent GC
+        anim.start()
 
     def _build_strip(self):
         f = QFrame(); f.setFixedHeight(88)
@@ -1409,23 +1898,13 @@ class MauSimulator(BaseToolWindow):
         f = QFrame(); f.setStyleSheet(f"QFrame{{background:{self._BG};border:none;}}")
         h = QHBoxLayout(f); h.setContentsMargins(3, 3, 3, 3); h.setSpacing(5)
 
-        defs = [
-            ("HTC-1\nPREHEAT",   self._pid[0], self._fo[0],  0.0,    40.0),  # hi=HW 40°C
-            ("CC-1\nPRECOOL",    self._pid[1], self._fo[1],  7.0,    40.0),  # lo=CHW 7°C
-            ("WASHER\nHUMIDIFY", self._pid[2], self._fo[2],  50.0,  100.0),
-            ("CC-2\nDEHUMID",    self._pid[3], self._fo[3],  7.0,    30.0),  # lo=CHW 7°C
-            ("HTC-2\nREHEAT",    self._pid[4], self._fo[4],  7.0,    40.0),  # hi=HW 40°C
-            ("SUPPLY\nFAN",      self._pid[5], self._fo[5],  500.0, 4000.0),
-        ]
-        default_sps = [22.0, 24.0, 90.0, 10.0, 22.0, 2000.0]
         self._fp: list[_StageFaceplate] = []
-        for idx, ((name, pid, fo, lo, hi), sp) in enumerate(zip(defs, default_sps)):
-            i = idx
-            htc1_modes = [("T °C", 0.0, 40.0, 22.0), ("H kJ/kg", 0.0, 100.0, 40.0)] if idx == 0 else None
-            fp = _StageFaceplate(name, pid, fo, lo, hi,
+        for i, (name, lo, hi, sp, _, _, modes) in enumerate(_STAGE_DEFS):
+            fp = _StageFaceplate(name, self._pid[i], self._fo[i], lo, hi,
                                  select_cb=lambda i=i: self._set_selected(i),
-                                 pv_modes=htc1_modes)
-            if not htc1_modes:
+                                 pv_modes=modes,
+                                 on_change=self._save_mau_config)
+            if not modes:
                 fp._sp = sp; fp._sp_in.setText(f"{sp:.1f}")
             self._fp.append(fp); h.addWidget(fp, 1)
         return f
@@ -1824,7 +2303,7 @@ class MauSimulator(BaseToolWindow):
         self._chart = _PsychrometricChart(); lay.addWidget(self._chart, 1); return f
 
     def _build_target(self):
-        f = QFrame(); f.setFixedHeight(110)
+        f = QFrame(); f.setFixedHeight(130)
         f.setStyleSheet(f"QFrame{{background:{self._CELL};border:1px solid {self._BDR};border-radius:4px;}}")
         g = QGridLayout(f); g.setContentsMargins(10,8,10,8); g.setSpacing(6)
         def hdr(t, clr="#7AAABB"):
@@ -1887,6 +2366,10 @@ class MauSimulator(BaseToolWindow):
         self._cur_lbl.setStyleSheet(f"color:{self._ACC};font-size:10pt;font-weight:700;"
                                     f"background:transparent;border:none;font-family:Consolas;")
         g.addWidget(hdr("CURRENT STATUS"), 3, 0); g.addWidget(self._cur_lbl, 3, 1, 1, 4)
+        self._ilock_lbl = QLabel("—")
+        self._ilock_lbl.setStyleSheet("color:#888;font-size:8pt;font-weight:600;"
+                                      "background:transparent;border:none;font-family:Consolas;")
+        g.addWidget(hdr("INTERLOCKS"), 4, 0); g.addWidget(self._ilock_lbl, 4, 1, 1, 4)
         self._T_sp = 22.0; self._RH_sp = 50.0; self._T_tol = 2.0; self._RH_tol = 5.0
         return f
 
@@ -1905,6 +2388,8 @@ class MauSimulator(BaseToolWindow):
         for i, fp in enumerate(self._fp): fp.set_selected(i == idx)
         self._schematic.set_selected(idx + 1)
         self._overlay.set_sel(idx)
+        name, lo, hi = _STAGE_DEFS[idx][0], _STAGE_DEFS[idx][1], _STAGE_DEFS[idx][2]
+        self._trend.select(idx, name, lo, hi, _SACCNT[idx + 1])
 
     def _on_schematic_click(self, stage_idx: int):
         fp_idx = stage_idx - 1
@@ -1916,10 +2401,140 @@ class MauSimulator(BaseToolWindow):
         for fp in self._fp: fp.set_selected(False)
         self._schematic.set_selected(-1)
         self._overlay.set_sel(-1)
+        self._trend.clear_selection()
 
     # ── climate ──────────────────────────────────────────
+    def _export_report(self):
+        if not self._states: return
+        import csv, os
+        from datetime import datetime
+
+        path, _ = QFileDialog.getSaveFileName(
+            self, "匯出報告 Export Report",
+            os.path.expanduser(f"~/MAU_Report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"),
+            "CSV Files (*.csv);;HTML Files (*.html);;All Files (*)"
+        )
+        if not path: return
+
+        sa   = self._states[6]
+        oa   = self._states[0]
+        mvs  = self._latest_mvs
+        now  = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        in_T  = abs(sa.T  - self._T_sp) <= self._T_tol
+        in_RH = abs(sa.RH - self._RH_sp) <= self._RH_tol
+        status = "ON TARGET" if (in_T and in_RH) else "OFF TARGET"
+
+        pv_vals = [
+            self._states[1].h if self._fp[0].pv_mode_idx == 1 else self._states[1].T,
+            self._states[2].T, self._states[3].RH,
+            self._states[4].T_dp, self._states[5].T, self._p_static,
+        ]
+        pv_units = [
+            "kJ/kg" if self._fp[0].pv_mode_idx == 1 else "°C",
+            "°C", "%RH", "°C dp", "°C", "Pa",
+        ]
+
+        if path.lower().endswith(".html"):
+            self._export_html(path, now, oa, sa, mvs, pv_vals, pv_units, status)
+        else:
+            self._export_csv(path, now, oa, sa, mvs, pv_vals, pv_units, status)
+
+    def _export_csv(self, path, now, oa, sa, mvs, pv_vals, pv_units, status):
+        import csv
+        with open(path, "w", newline="", encoding="utf-8-sig") as f:
+            w = csv.writer(f)
+            w.writerow(["MAU PRO-SIM Report", now])
+            w.writerow([])
+            w.writerow(["OUTDOOR AIR", "T (°C)", f"{oa.T:.2f}",
+                        "RH (%)", f"{oa.RH:.1f}", "w (g/kg)", f"{oa.w_gkg:.2f}"])
+            w.writerow(["CLIMATE MODE", self._climate])
+            w.writerow([])
+            w.writerow(["TARGET ZONE", f"T = {self._T_sp:.1f} ± {self._T_tol:.1f} °C",
+                        f"RH = {self._RH_sp:.1f} ± {self._RH_tol:.1f} %"])
+            w.writerow([])
+            w.writerow(["Stage", "SP", "PV", "Unit", "MV (%)",
+                        "Kp", "Ki", "Kd", "FO Gain", "FO τ(s)", "FO L(s)"])
+            for i, (name, _, _, _, _, _, _) in enumerate(_STAGE_DEFS):
+                fp = self._fp[i]
+                w.writerow([name.replace("\n", " "),
+                            f"{fp.sp:.2f}", f"{pv_vals[i]:.2f}", pv_units[i],
+                            f"{mvs[i]:.1f}",
+                            fp._pid.Kp, fp._pid.Ki, fp._pid.Kd,
+                            fp._fopdt.Kp, fp._fopdt.tau, fp._fopdt.L])
+            w.writerow([])
+            w.writerow(["FINAL SUPPLY AIR",
+                        f"T = {sa.T:.2f} °C", f"RH = {sa.RH:.1f} %",
+                        f"w = {sa.w_gkg:.2f} g/kg", f"h = {sa.h:.1f} kJ/kg"])
+            w.writerow(["STATUS", status])
+
+    def _export_html(self, path, now, oa, sa, mvs, pv_vals, pv_units, status):
+        clr = "#00CC55" if status == "ON TARGET" else "#FF3322"
+        rows = ""
+        for i, (name, _, _, _, _, _, _) in enumerate(_STAGE_DEFS):
+            fp = self._fp[i]
+            rows += (f"<tr><td>{name.replace(chr(10),' ')}</td>"
+                     f"<td>{fp.sp:.2f}</td><td>{pv_vals[i]:.2f} {pv_units[i]}</td>"
+                     f"<td>{mvs[i]:.1f}%</td>"
+                     f"<td>{fp._pid.Kp} / {fp._pid.Ki} / {fp._pid.Kd}</td>"
+                     f"<td>{fp._fopdt.Kp} / {fp._fopdt.tau:.1f} / {fp._fopdt.L:.1f}</td></tr>\n")
+        html = f"""<!DOCTYPE html><html><head><meta charset="utf-8">
+<title>MAU Report {now}</title>
+<style>
+  body{{font-family:Consolas,monospace;background:#050B18;color:#C8D8E8;padding:24px}}
+  h2{{color:#00B4D8}} h3{{color:#4A8AB8;margin-top:18px}}
+  table{{border-collapse:collapse;width:100%;margin-top:8px}}
+  th{{background:#0A1428;color:#00B4D8;padding:6px 10px;text-align:left;border:1px solid #162440}}
+  td{{padding:5px 10px;border:1px solid #0D1C30}}
+  tr:nth-child(even){{background:#080F1E}}
+  .status{{font-size:1.3em;font-weight:bold;color:{clr}}}
+</style></head><body>
+<h2>MAU PRO-SIM — Report</h2>
+<p style="color:#4A6A8A">{now} &nbsp;|&nbsp; Climate: {self._climate}</p>
+<h3>Outdoor Air</h3>
+<table><tr><th>T (°C)</th><th>RH (%)</th><th>w (g/kg)</th><th>h (kJ/kg)</th></tr>
+<tr><td>{oa.T:.2f}</td><td>{oa.RH:.1f}</td><td>{oa.w_gkg:.2f}</td><td>{oa.h:.1f}</td></tr></table>
+<h3>Target Zone</h3>
+<p>T = {self._T_sp:.1f} ± {self._T_tol:.1f} °C &nbsp;&nbsp; RH = {self._RH_sp:.1f} ± {self._RH_tol:.1f} %</p>
+<h3>Stage Data</h3>
+<table><tr><th>Stage</th><th>SP</th><th>PV</th><th>MV</th><th>PID Kp/Ki/Kd</th><th>FOPDT Kp/τ/L</th></tr>
+{rows}</table>
+<h3>Final Supply Air</h3>
+<table><tr><th>T (°C)</th><th>RH (%)</th><th>w (g/kg)</th><th>h (kJ/kg)</th></tr>
+<tr><td>{sa.T:.2f}</td><td>{sa.RH:.1f}</td><td>{sa.w_gkg:.2f}</td><td>{sa.h:.1f}</td></tr></table>
+<h3>Status</h3><p class="status">{status}</p>
+</body></html>"""
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(html)
+        import webbrowser; webbrowser.open(path)
+
+    def _save_mau_config(self):
+        cfg = load_config()
+        cfg["mau_sim"] = {
+            "climate": self._climate,
+            "custom_T": self._custom_T, "custom_RH": self._custom_RH,
+            "T_sp": self._T_sp, "T_tol": self._T_tol,
+            "RH_sp": self._RH_sp, "RH_tol": self._RH_tol,
+            "fp": [fp.get_state() for fp in self._fp],
+        }
+        save_config(cfg)
+
+    def _load_mau_config(self):
+        d = load_config().get("mau_sim", {})
+        if not d: return
+        if "climate"   in d: self._climate    = d["climate"];    self._update_clim_btns()
+        if "custom_T"  in d:
+            self._custom_T  = d["custom_T"];  self._custom_T_in.setText(f"{self._custom_T:.1f}")
+        if "custom_RH" in d:
+            self._custom_RH = d["custom_RH"]; self._custom_RH_in.setText(f"{self._custom_RH:.0f}")
+        if "T_sp"  in d: self._T_sp  = d["T_sp"];  self._T_sp_in.setText(f"{self._T_sp:.1f}")
+        if "T_tol" in d: self._T_tol = d["T_tol"]; self._T_tol_in.setText(f"±{self._T_tol:.1f}")
+        if "RH_sp"  in d: self._RH_sp  = d["RH_sp"];  self._RH_sp_in.setText(f"{self._RH_sp:.1f}")
+        if "RH_tol" in d: self._RH_tol = d["RH_tol"]; self._RH_tol_in.setText(f"±{self._RH_tol:.1f}")
+        for i, st in enumerate(d.get("fp", [])):
+            if i < len(self._fp): self._fp[i].set_state(st)
+
     def _set_climate(self, mode: str):
-        self._climate = mode; self._update_clim_btns(); self._reset()
+        self._climate = mode; self._update_clim_btns(); self._reset(); self._save_mau_config()
 
     def _update_clim_btns(self):
         clim = self._climate
@@ -1941,6 +2556,7 @@ class MauSimulator(BaseToolWindow):
         except: pass
         try: self._custom_RH = max(10.0,  min(100.0, float(self._custom_RH_in.text())))
         except: pass
+        self._save_mau_config()
 
     def _commit_targets(self):
         try: self._T_sp   = float(self._T_sp_in.text())
@@ -1951,6 +2567,7 @@ class MauSimulator(BaseToolWindow):
         except: pass
         try: self._RH_tol = abs(float(self._RH_tol_in.text().replace("±","")))
         except: pass
+        self._save_mau_config()
 
     # ── simulation ───────────────────────────────────────
     def _oa(self):
@@ -1958,68 +2575,42 @@ class MauSimulator(BaseToolWindow):
         if self._climate == "Custom": return AirState(self._custom_T, Psych.omega(self._custom_T, self._custom_RH))
         return AirState(6.0, Psych.omega(6.0, 50.0))
 
-    def _reset(self):
-        if not hasattr(self, "_timer"): return
-        self._timer.stop(); oa = self._oa()
-        self._states = [oa.copy() for _ in range(7)]
-        self._fan_hz = 45.0; self._p_static = 2000.0
-        for pid in self._pid: pid.reset()
-        for fo in self._fo: fo.reset()
-        self._timer.start(50)
+    def _set_speed(self, v: int):
+        self._speed = v
+        self._worker.set_speed(v)
 
-    def _tick(self):
-        for _ in range(self._speed): self._step(self._DT)
+    def _reset(self):
+        if not hasattr(self, "_worker"): return
+        self._alarm_ticks = 0
+        self._worker.reset_sim()
+
+    @pyqtSlot(list, list, float, float)
+    def _on_sim_stepped(self, states, mvs, p_static, fan_hz):
+        self._states      = states
+        self._latest_mvs  = mvs
+        self._p_static    = p_static
+        self._fan_hz      = fan_hz
         self._update_ui()
 
-    def _step(self, dt):
-        oa = self._oa(); s = [oa.copy() for _ in range(7)]
-
-        # Fan (compute first for coupling)
-        mv_fan = self._pid[5].compute(self._p_static, self._fp[5].sp, dt)
-        self._fan_hz = 30.0 + (mv_fan / 100.0) * 30.0
-        fan_sc = 45.0 / max(self._fan_hz, 1.0)
-        # FOPDT pressure lag: Kp=40 → at 100%MV steady=4000Pa
-        self._p_static = max(100.0, self._fo[5].step(mv_fan, dt, 1.0))
-
-        # HTC-1: preheat (PV = T°C or enthalpy kJ/kg depending on user selection)
-        pv_htc1 = self._states[1].h if self._fp[0].pv_mode_idx == 1 else self._states[1].T
-        mv1 = self._pid[0].compute(pv_htc1, self._fp[0].sp, dt)
-        T1 = min(40.0, oa.T + self._fo[0].step(mv1, dt, fan_sc))  # clamp to HW=40°C
-        s[1] = AirState(T=T1, w=oa.w)
-
-        # CC-1: precool, condensation check
-        mv2 = self._pid[1].compute(self._states[2].T, self._fp[1].sp, dt)
-        T2 = max(7.0, s[1].T + self._fo[1].step(mv2, dt, fan_sc))  # clamp to CHW=7°C
-        w2 = s[1].w
-        if T2 < Psych.t_dp(w2): w2 = max(0.0, Psych.omega_sat(T2))
-        s[2] = AirState(T=T2, w=w2)
-
-        # Washer: adiabatic humidification with FOPDT lag on effectiveness
-        mv3 = self._pid[2].compute(self._states[3].RH, self._fp[2].sp, dt)
-        # fo[2] Kp=1.0: step(mv3) → 0..100 at ss, /100 → 0..1, cap at 0.92
-        eta = min(0.92, max(0.0, self._fo[2].step(mv3, dt, 1.0) / 100.0))
-        T_wb = Psych.t_wb(s[2].T, s[2].w); w_sat_wb = Psych.omega_sat(T_wb)
-        T3 = s[2].T - eta * (s[2].T - T_wb)
-        w3 = min(s[2].w + eta * (w_sat_wb - s[2].w), Psych.omega_sat(T3))
-        s[3] = AirState(T=T3, w=w3)
-
-        # CC-2: dehumidify — PV = outlet dew point (取樣在出風口)
-        mv4 = self._pid[3].compute(self._states[4].T_dp, self._fp[3].sp, dt)
-        T4 = max(7.0, s[3].T + self._fo[3].step(mv4, dt, fan_sc))  # clamp to CHW=7°C
-        w4 = s[3].w
-        if T4 < Psych.t_dp(s[3].w): w4 = max(0.0, Psych.omega_sat(T4))
-        s[4] = AirState(T=T4, w=w4)
-
-        # HTC-2: reheat
-        mv5 = self._pid[4].compute(self._states[5].T, self._fp[4].sp, dt)
-        T5 = min(40.0, s[4].T + self._fo[4].step(mv5, dt, fan_sc))  # clamp to HW=40°C
-        s[5] = AirState(T=T5, w=s[4].w)
-
-        s[6] = s[5].copy(); self._states = s
+    def _refresh_anim(self):
+        """Keeps schematic animation ticking even between sim signals."""
+        if self._states:
+            self._schematic.refresh(self._states, self._latest_mvs,
+                                    self._p_static, self._fan_hz)
 
     def _update_ui(self):
-        mvs = [p.mv for p in self._pid]
+        if not self._states: return
+        self._ui_tick = (self._ui_tick + 1) % 4
+        mvs = self._latest_mvs
+
+        # Every tick: schematic animation + numeric labels + trend push (cheap)
         self._schematic.refresh(self._states, mvs, self._p_static, self._fan_hz)
+        pv_htc1_push = self._states[1].h if self._fp[0].pv_mode_idx == 1 else self._states[1].T
+        push_pvs = [pv_htc1_push, self._states[2].T, self._states[3].RH,
+                    self._states[4].T_dp, self._states[5].T, self._p_static]
+        for i, (pv, mv) in enumerate(zip(push_pvs, mvs)):
+            self._trend.push(i, pv, self._fp[i].sp, mv)
+        if self._sel >= 0: self._trend.update()
 
         oa = self._states[0]
         self._oa_T_lbl.setText(f"{oa.T:.1f}°C")
@@ -2030,23 +2621,74 @@ class MauSimulator(BaseToolWindow):
                    self._states[4].T_dp, self._states[5].T, self._p_static]
         for fp, pv, mv in zip(self._fp, pv_vals, mvs): fp.update_display(pv, mv)
 
-        self._chart.refresh(self._states, self._T_sp, self._RH_sp,
-                            self._T_tol, self._RH_tol, sel=self._sel)
-        self._update_formula_page()
-
         sa = self._states[6]
         self._final_T_lbl.setText(f"{sa.T:.1f}°C")
         self._final_lbl.setText(f"{sa.RH:.0f}%")
-        in_T = abs(sa.T - self._T_sp) <= self._T_tol
+        in_T  = abs(sa.T  - self._T_sp)  <= self._T_tol
         in_RH = abs(sa.RH - self._RH_sp) <= self._RH_tol
         ok = in_T and in_RH
+        if ok:
+            self._alarm_ticks = 0
+            clr  = "#00FF88"
+            text = f"{sa.T:.1f} °C   {sa.RH:.0f}% RH   ✓ ON TARGET"
+        else:
+            self._alarm_ticks += 1
+            if self._alarm_ticks >= 200:                # ≥ 10 s — flashing alarm
+                flash = self._ui_tick % 4 < 2
+                clr  = "#FF2200" if flash else "#FF8800"
+                text = f"⚠ ALARM   {sa.T:.1f}°C {'✓' if in_T else '✗'}  {sa.RH:.0f}% RH {'✓' if in_RH else '✗'}"
+            else:                                        # < 10 s — warning
+                clr  = "#FFCC00"
+                text = f"{sa.T:.1f} °C   {sa.RH:.0f}% RH   ⚠ OFF TARGET"
         self._cur_lbl.setStyleSheet(
-            f"color:{'#00FF88' if ok else '#FF4433'};font-size:8.5pt;font-weight:700;"
+            f"color:{clr};font-size:8.5pt;font-weight:700;"
             f"background:transparent;border:none;font-family:Consolas;")
-        self._cur_lbl.setText(
-            f"{sa.T:.1f} °C   {sa.RH:.0f}% RH   {'✓ ON TARGET' if ok else '✗ OFF TARGET'}")
+        self._cur_lbl.setText(text)
+
+        # Interlock detection
+        active = []
+        if mvs[5] < 8.0:
+            active.append(("LOW FAN", "#FF4400"))
+        if mvs[0] > 70.0 and mvs[1] > 30.0:
+            active.append(("HTC+CC CONFLICT", "#FF8800"))
+        if mvs[2] > 60.0 and mvs[3] > 60.0:
+            active.append(("WASH+CC2 CONFLICT", "#FF8800"))
+        if self._states[5].T > 35.0:
+            active.append(("HIGH SUPPLY T", "#FF2200"))
+        if active:
+            parts = "  |  ".join(f'<span style="color:{c}">{n}</span>' for n, c in active)
+            self._ilock_lbl.setText(parts)
+            self._ilock_lbl.setTextFormat(Qt.TextFormat.RichText)
+        else:
+            self._ilock_lbl.setTextFormat(Qt.TextFormat.PlainText)
+            self._ilock_lbl.setStyleSheet("color:#00CC66;font-size:8pt;font-weight:600;"
+                                          "background:transparent;border:none;font-family:Consolas;")
+            self._ilock_lbl.setText("OK — no active interlocks")
+
+        # Every 4 ticks (~5fps): heavy static charts
+        if self._ui_tick == 0:
+            self._chart.refresh(self._states, self._T_sp, self._RH_sp,
+                                self._T_tol, self._RH_tol, sel=self._sel)
+            self._update_formula_page()
 
     # ── lifecycle ────────────────────────────────────────
+    def keyPressEvent(self, e):
+        k = e.key()
+        if k == Qt.Key.Key_Space:
+            self._reset()
+        elif Qt.Key.Key_1 <= k <= Qt.Key.Key_6:
+            self._set_selected(k - Qt.Key.Key_1)
+        elif k == Qt.Key.Key_Escape:
+            self._clear_selection()
+        elif k == Qt.Key.Key_S:
+            self._set_climate("Summer")
+        elif k == Qt.Key.Key_W:
+            self._set_climate("Winter")
+        elif k == Qt.Key.Key_C:
+            self._set_climate("Custom")
+        else:
+            super().keyPressEvent(e)
+
     def resizeEvent(self, e):
         super().resizeEvent(e)
         if hasattr(self, '_overlay'):
@@ -2055,7 +2697,11 @@ class MauSimulator(BaseToolWindow):
 
     def showEvent(self, e):
         super().showEvent(e)
-        if not self._timer.isActive(): self._timer.start(50)
+        if not self._sim_thread.isRunning():
+            self._sim_thread.start()   # first open: thread emits started → start_sim
+        else:
+            self._sig_resume.emit()    # subsequent open: resume worker timer
+        if not self._ui_timer.isActive(): self._ui_timer.start(50)
         scr = QApplication.primaryScreen()
         if scr:
             ag = scr.availableGeometry()
@@ -2065,7 +2711,11 @@ class MauSimulator(BaseToolWindow):
             self._overlay.raise_()
 
     def hideEvent(self, e):
-        self._timer.stop(); super().hideEvent(e)
+        self._sig_pause.emit()         # pause worker computation
+        self._ui_timer.stop(); super().hideEvent(e)
 
     def closeEvent(self, e):
-        self._timer.stop(); super().closeEvent(e)
+        self._sig_pause.emit()
+        self._ui_timer.stop()
+        self._sim_thread.quit(); self._sim_thread.wait(500)
+        super().closeEvent(e)

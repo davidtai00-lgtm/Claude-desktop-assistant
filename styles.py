@@ -54,6 +54,69 @@ def save_config(cfg: dict):
         print(f"[WARN] config: {e}", file=sys.stderr)
 
 # ═══════════════════════════════════════════════════════
+#  THEMES
+# ═══════════════════════════════════════════════════════
+# Each entry maps the 6 core UI colors used by MAU and PID tools.
+# bg/toolbar_bg: darkest panels; cell/card_bg: mid panels; bdr: borders; acc: accent
+THEMES = [
+    {"name": "Cyber Blue",
+     "bg": "#050B18", "toolbar_bg": "#06091A", "cell": "#0A1428",
+     "card_bg": "#09122A", "bdr": "#162440", "acc": "#00B4D8"},
+    {"name": "Emerald",
+     "bg": "#041008", "toolbar_bg": "#050D06", "cell": "#081A0E",
+     "card_bg": "#091808", "bdr": "#102810", "acc": "#00D490"},
+    {"name": "Violet",
+     "bg": "#0C0814", "toolbar_bg": "#0A0612", "cell": "#120E1E",
+     "card_bg": "#100C1C", "bdr": "#201638", "acc": "#9B77FF"},
+    {"name": "Amber",
+     "bg": "#100900", "toolbar_bg": "#120A00", "cell": "#1A0D00",
+     "card_bg": "#160B00", "bdr": "#301800", "acc": "#FFB300"},
+    {"name": "Carbon",
+     "bg": "#0A0A0A", "toolbar_bg": "#080808", "cell": "#111111",
+     "card_bg": "#0E0E0E", "bdr": "#1E1E1E", "acc": "#A0A0A0"},
+]
+
+def get_theme_idx() -> int:
+    return int(load_config().get("theme_idx", 0))
+
+def set_theme_idx(idx: int):
+    cfg = load_config()
+    cfg["theme_idx"] = max(0, min(idx, len(THEMES) - 1))
+    save_config(cfg)
+
+
+class ThemePicker(QWidget):
+    """Row of colored dot buttons — one per theme — for inline toolbar use."""
+    def __init__(self, callback, parent=None):
+        super().__init__(parent)
+        self._cb = callback
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0); lay.setSpacing(5)
+        self._btns = []
+        for i, t in enumerate(THEMES):
+            b = QPushButton()
+            b.setFixedSize(14, 14)
+            b.setToolTip(t["name"])
+            b.clicked.connect(lambda _, idx=i: self._pick(idx))
+            self._btns.append(b)
+            lay.addWidget(b)
+        self._mark(get_theme_idx())
+
+    def _pick(self, idx: int):
+        set_theme_idx(idx)
+        self._mark(idx)
+        self._cb(idx)
+
+    def _mark(self, idx: int):
+        for i, b in enumerate(self._btns):
+            acc = THEMES[i]["acc"]
+            ring = "2px solid #fff" if i == idx else "1px solid rgba(255,255,255,0.25)"
+            b.setStyleSheet(
+                f"QPushButton{{background:{acc};border-radius:7px;border:{ring};}}"
+                f"QPushButton:hover{{border:2px solid #fff;}}"
+            )
+
+# ═══════════════════════════════════════════════════════
 #  SHARED QSS  (glass-morphism dark theme)
 # ═══════════════════════════════════════════════════════
 GLASS_QSS = """

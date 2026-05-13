@@ -28,7 +28,7 @@ from PyQt6.QtWidgets import (
     QPushButton, QLineEdit, QScrollArea, QSlider,
 )
 
-from styles import BaseToolWindow
+from styles import BaseToolWindow, load_config, save_config
 
 
 class PidTunerBuddy(BaseToolWindow):
@@ -108,6 +108,9 @@ class PidTunerBuddy(BaseToolWindow):
 
         self._slider_following = True
         self._slider_dragging  = False
+        self._sv_tol      = 5.0    # on-target tolerance (%)
+        self._alarm_ticks = 0
+        self._show_pv = True; self._show_sv = True; self._show_mv = True
 
         self.content.setStyleSheet(f"background:{self._BG};")
 
@@ -155,14 +158,16 @@ class PidTunerBuddy(BaseToolWindow):
         self._build_timeline_slider(root)  # 2. timeline scrubber
         self._build_live_strip(root)       # 3. PV / SV large
         self._build_ctrl_row(root)         # 4. mode + SV target + manual MV
-        self._build_mv_limit_row(root)     # 5. MV readout + PV/MV MAX/MIN
-        self._build_status_bar(root)       # 6. status bar
+        self._build_alarm_bar(root)        # 5. alarm / target status
+        self._build_mv_limit_row(root)     # 6. MV readout + PV/MV MAX/MIN
+        self._build_status_bar(root)       # 7. status bar
 
         # ── Build right panel sections ────────────────────
         self._build_param_cols(right_lay)  # PID | FOPDT params
 
         self._sim_timer = QTimer(self)
         self._sim_timer.timeout.connect(self._sim_tick)
+        self._load_cfg()
         self._reset_sim()
 
     # ════════════════════════════════════════════════════
@@ -215,6 +220,26 @@ class PidTunerBuddy(BaseToolWindow):
             pen=pg.mkPen(self._MV_CLR, width=1.8), name="MV %")
         legend = pw.addLegend(offset=(4, 4))
         legend.setLabelTextColor(self._LBL)
+
+        # Curve visibility toggles
+        tog = QWidget(); tog.setFixedHeight(22)
+        tog.setStyleSheet("background:transparent;")
+        tl = QHBoxLayout(tog); tl.setContentsMargins(0, 0, 0, 2); tl.setSpacing(4)
+        tl.addStretch()
+        for label, clr, curve in [("PV", self._PV_CLR, self._pv_curve),
+                                   ("SV", self._SV_CLR, self._sv_curve),
+                                   ("MV", self._MV_CLR, self._cv_curve)]:
+            b = QPushButton(label); b.setCheckable(True); b.setChecked(True)
+            b.setFixedSize(32, 16)
+            b.setStyleSheet(
+                f"QPushButton{{background:#080F1C;color:{clr};border:1px solid #1A3050;"
+                f"border-radius:2px;font-size:7pt;font-family:Consolas;font-weight:700;padding:0;}}"
+                f"QPushButton:checked{{background:{clr};color:#000;border:1px solid {clr};}}"
+                f"QPushButton:!checked{{color:#333;border-color:#111;}}"
+            )
+            b.toggled.connect(lambda v, c=curve: c.setVisible(v))
+            tl.addWidget(b)
+        lay.addWidget(tog)
         lay.addWidget(pw, 3)
         self._pw = pw
 
@@ -372,6 +397,13 @@ class PidTunerBuddy(BaseToolWindow):
         self._sv_init_in.editingFinished.connect(self._sv_init_changed)
         r2.addWidget(self._sv_init_in)
         r2.addWidget(self._tag("%  (reset → SV)", self._LBL2, 8))
+        r2.addWidget(self._vline())
+
+        r2.addWidget(self._tag("容差  TOL ±", self._LBL2, 8))
+        self._tol_in = self._inp(f"{self._sv_tol:.1f}", "#FFAA00", 52, 10)
+        self._tol_in.editingFinished.connect(self._tol_changed)
+        r2.addWidget(self._tol_in)
+        r2.addWidget(self._tag("%", self._LBL2, 8))
         r2.addStretch()
 
         v.addLayout(r2)
@@ -920,7 +952,8 @@ class PidTunerBuddy(BaseToolWindow):
             self._timeline_slider.setRange(0, int(self._SPAN))
             self._timeline_slider.setValue(0)
             self._timeline_slider.blockSignals(False)
-        self._sim_timer.start(50)
+        if self.isVisible():
+            self._sim_timer.start(50)
 
     def _sim_tick(self):
         dt = self._DT
@@ -996,6 +1029,27 @@ class PidTunerBuddy(BaseToolWindow):
             else:
                 self._peak_disp.setText(f"peak  {self._peak_pv*100:.2f}%")
             self._update_hmi()
+
+            # ── Alarm logic (MAU-style) ───────────────
+            err_pct = abs(pv_pct - self._sv_pct)
+            if err_pct <= self._sv_tol:
+                self._alarm_ticks = 0
+                clr = "#00FF88"
+                atxt = f"✓ ON TARGET   PV={pv_pct:.1f}%  SV={self._sv_pct:.1f}%  Δ={err_pct:.1f}%"
+            else:
+                self._alarm_ticks += 1
+                if self._alarm_ticks >= 20:       # ≥ 10 s off-target → flashing ALARM
+                    flash = (self._alarm_ticks // 2) % 2 == 0
+                    clr  = "#FF2200" if flash else "#FF8800"
+                    atxt = f"⚠ ALARM   PV={pv_pct:.1f}%  SV={self._sv_pct:.1f}%  Δ={err_pct:.1f}%"
+                else:
+                    clr  = "#FFCC00"
+                    atxt = f"⚠ OFF TARGET   PV={pv_pct:.1f}%  SV={self._sv_pct:.1f}%  Δ={err_pct:.1f}%"
+            if hasattr(self, "_alarm_lbl"):
+                self._alarm_lbl.setStyleSheet(
+                    f"color:{clr};font-size:8.5pt;font-weight:700;"
+                    f"background:transparent;border:none;font-family:Consolas;")
+                self._alarm_lbl.setText(atxt)
 
     # ════════════════════════════════════════════════════
     #  INDUSTRIAL HMI PANEL
@@ -1182,8 +1236,89 @@ class PidTunerBuddy(BaseToolWindow):
     def closeEvent(self, e):
         self._sim_timer.stop(); super().closeEvent(e)
 
+    # ════════════════════════════════════════════════════
+    #  ALARM BAR
+    # ════════════════════════════════════════════════════
+    def _build_alarm_bar(self, lay: QVBoxLayout):
+        f = QFrame()
+        f.setStyleSheet(f"QFrame{{background:#04091A;"
+                        f"border:1px solid {self._BORDER};border-radius:4px;}}")
+        f.setFixedHeight(28)
+        h = QHBoxLayout(f); h.setContentsMargins(10, 4, 10, 4); h.setSpacing(10)
+        tol_lbl = QLabel(f"TOL ±{self._sv_tol:.1f}%")
+        tol_lbl.setStyleSheet(f"color:{self._LBL2};font-size:8pt;font-weight:600;"
+                              f"background:transparent;border:none;font-family:Consolas;")
+        self._alarm_tol_lbl = tol_lbl
+        h.addWidget(tol_lbl)
+        h.addWidget(self._vline())
+        self._alarm_lbl = QLabel("—")
+        self._alarm_lbl.setStyleSheet(f"color:{self._ACC};font-size:8.5pt;font-weight:700;"
+                                      f"background:transparent;border:none;font-family:Consolas;")
+        h.addWidget(self._alarm_lbl)
+        h.addStretch()
+        lay.addWidget(f)
+
+    # ════════════════════════════════════════════════════
+    #  CONFIG PERSISTENCE
+    # ════════════════════════════════════════════════════
+    def _save_cfg(self):
+        cfg = load_config()
+        cfg["pid_tuner_2"] = {
+            "Kp": self._Kp, "Ki": self._Ki, "Kd": self._Kd,
+            "pK": self._pK, "pT": self._pT, "pL": self._pL,
+            "sv": self._sv_pct, "sv_init": self._sv_init,
+            "sv_tol": self._sv_tol, "reverse": self._reverse_action,
+            "mv_max": self._mv_max, "mv_min": self._mv_min,
+            "pv_max": self._pv_max, "pv_min": self._pv_min,
+        }
+        save_config(cfg)
+
+    def _load_cfg(self):
+        d = load_config().get("pid_tuner_2", {})
+        def _f(key, default): return float(d[key]) if key in d else default
+        def _b(key, default): return bool(d[key])  if key in d else default
+        self._Kp = _f("Kp", self._Kp); self._Ki = _f("Ki", self._Ki)
+        self._Kd = _f("Kd", self._Kd); self._pK = _f("pK", self._pK)
+        self._pT = _f("pT", self._pT); self._pL = _f("pL", self._pL)
+        self._sv_pct  = _f("sv",      self._sv_pct)
+        self._sv_init = _f("sv_init", self._sv_init)
+        self._sv_tol  = _f("sv_tol",  self._sv_tol)
+        self._mv_max  = _f("mv_max",  self._mv_max)
+        self._mv_min  = _f("mv_min",  self._mv_min)
+        self._pv_max  = _f("pv_max",  self._pv_max)
+        self._pv_min  = _f("pv_min",  self._pv_min)
+        self._reverse_action = _b("reverse", self._reverse_action)
+        # Sync UI fields (widgets created before _load_cfg is called)
+        for attr, widget in [("_Kp","_pid_inputs"), ("_sv_pct","_sv_in"),
+                              ("_sv_init","_sv_init_in"), ("_sv_tol","_tol_in"),
+                              ("_pv_max","_pv_max_in"), ("_pv_min","_pv_min_in"),
+                              ("_mv_max","_mv_max_in"), ("_mv_min","_mv_min_in")]:
+            pass   # widgets are synced via _pid_inputs + individual attrs below
+        if hasattr(self, "_sv_in"):     self._sv_in.setText(f"{self._sv_pct:.1f}")
+        if hasattr(self, "_sv_init_in"):self._sv_init_in.setText(f"{self._sv_init:.1f}")
+        if hasattr(self, "_tol_in"):    self._tol_in.setText(f"{self._sv_tol:.1f}")
+        if hasattr(self, "_mv_max_in"): self._mv_max_in.setText(f"{self._mv_max:.0f}")
+        if hasattr(self, "_mv_min_in"): self._mv_min_in.setText(f"{self._mv_min:.0f}")
+        if hasattr(self, "_pv_max_in"): self._pv_max_in.setText(f"{self._pv_max:.0f}")
+        if hasattr(self, "_pv_min_in"): self._pv_min_in.setText(f"{self._pv_min:.0f}")
+        if hasattr(self, "_alarm_tol_lbl"):
+            self._alarm_tol_lbl.setText(f"TOL ±{self._sv_tol:.1f}%")
+        for key, attr in [("Kp","Kp"),("Ki","Ki"),("Kd","Kd")]:
+            if hasattr(self, "_pid_inputs") and key in self._pid_inputs:
+                v = getattr(self, f"_{attr}")
+                self._pid_inputs[key].setText(f"{v:.{3}f}")
+        self._refresh_action_btn()
+
+    def _tol_changed(self):
+        try: v = max(0.1, min(50.0, float(self._tol_in.text())))
+        except ValueError: v = self._sv_tol
+        self._sv_tol = v; self._tol_in.setText(f"{v:.1f}")
+        if hasattr(self, "_alarm_tol_lbl"):
+            self._alarm_tol_lbl.setText(f"TOL ±{v:.1f}%")
+        self._save_cfg()
+
     def hideEvent(self, e):
-        self._sim_timer.stop(); super().hideEvent(e)
+        self._save_cfg(); self._sim_timer.stop(); super().hideEvent(e)
 
     def showEvent(self, e):
         super().showEvent(e)

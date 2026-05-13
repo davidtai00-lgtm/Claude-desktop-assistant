@@ -57,5 +57,110 @@
       "out_min": 0.0,
       "out_max": 100.0
     }
-  ]
+  ],
+  "mau_sim": {
+    "climate": "Winter",
+    "custom_T": 20.0,
+    "custom_RH": 60.0,
+    "T_sp": 22.0,
+    "T_tol": 2.0,
+    "RH_sp": 50.0,
+    "RH_tol": 5.0,
+    "fp": [
+      {
+        "sp": 35.0,
+        "pv_lo": 0.0,
+        "pv_hi": 100.0,
+        "pid_kp": 2.5,
+        "pid_ki": 0.08,
+        "pid_kd": 0.0,
+        "fo_kp": 0.28,
+        "fo_tau": 55.0,
+        "fo_l": 5.0,
+        "auto": true,
+        "pv_mode_idx": 1
+      },
+      {
+        "sp": 24.0,
+        "pv_lo": 7.0,
+        "pv_hi": 40.0,
+        "pid_kp": 1.8,
+        "pid_ki": 0.05,
+        "pid_kd": 0.0,
+        "fo_kp": 0.22,
+        "fo_tau": 65.0,
+        "fo_l": 6.0,
+        "auto": true,
+        "pv_mode_idx": 0
+      },
+      {
+        "sp": 100.0,
+        "pv_lo": 50.0,
+        "pv_hi": 100.0,
+        "pid_kp": 2.0,
+        "pid_ki": 0.1,
+        "pid_kd": 0.0,
+        "fo_kp": 5.0,
+        "fo_tau": 30.0,
+        "fo_l": 3.0,
+        "auto": true,
+        "pv_mode_idx": 0
+      },
+      {
+        "sp": 10.0,
+        "pv_lo": 7.0,
+        "pv_hi": 30.0,
+        "pid_kp": 3.0,
+        "pid_ki": 0.15,
+        "pid_kd": 0.0,
+        "fo_kp": 0.22,
+        "fo_tau": 35.0,
+        "fo_l": 4.0,
+        "auto": true,
+        "pv_mode_idx": 0
+      },
+      {
+        "sp": 22.0,
+        "pv_lo": 7.0,
+        "pv_hi": 40.0,
+        "pid_kp": 2.0,
+        "pid_ki": 0.1,
+        "pid_kd": 0.0,
+        "fo_kp": 0.28,
+        "fo_tau": 45.0,
+        "fo_l": 5.0,
+        "auto": true,
+        "pv_mode_idx": 0
+      },
+      {
+        "sp": 2000.0,
+        "pv_lo": 500.0,
+        "pv_hi": 4000.0,
+        "pid_kp": 0.05,
+        "pid_ki": 0.03,
+        "pid_kd": 0.0,
+        "fo_kp": 40.0,
+        "fo_tau": 10.0,
+        "fo_l": 1.0,
+        "auto": true,
+        "pv_mode_idx": 0
+      }
+    ]
+  },
+  "pid_tuner_2": {
+    "Kp": 1.5,
+    "Ki": 0.0,
+    "Kd": 0.0,
+    "pK": 0.8,
+    "pT": 2.0,
+    "pL": 5.0,
+    "sv": 50.0,
+    "sv_init": 20.0,
+    "sv_tol": 5.0,
+    "reverse": false,
+    "mv_max": 100.0,
+    "mv_min": 0.0,
+    "pv_max": 100.0,
+    "pv_min": 0.0
+  }
 }
